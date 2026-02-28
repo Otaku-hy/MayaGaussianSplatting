@@ -8,3 +8,12 @@ remember to set
 
 this two variables in environment variables setting
 
+
+
+This project use DX11 as the render API,
+
+please set here:
+
+Windows → Settings/Preferences → Preferences
+  → Display → Viewport 2.0
+  → Rendering Engine: DirectX 11
