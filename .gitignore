@@ -1,0 +1,17 @@
+*.docx
+*.doc
+.vs/
+*.VC.db
+*.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.mll
+*.log
+*.vcxproj.user
