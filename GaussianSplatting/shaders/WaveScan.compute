@@ -1,0 +1,204 @@
+// WaveScan.compute
+// Inclusive prefix-sum (scan) implemented with HLSL Wave Intrinsics.
+//
+// Three-kernel pipeline:
+//   1. LocalScan        — each group produces a local inclusive scan + writes its total to _GroupSums
+//   2. ScanGroupSums    — single-group exclusive prefix-scan over _GroupSums
+//   3. AddGroupOffsets  — adds the group offset to every element
+//
+// Constraints:
+//   GROUP_SIZE = 64.  For correctness the inner inter-wave scan relies on
+//   numWaves = GROUP_SIZE / WaveGetLaneCount() fitting inside one wave
+//   (i.e. WaveGetLaneCount()^2 >= GROUP_SIZE).  With GROUP_SIZE=64 this
+//   holds for any laneCount >= 8, covering all SM6 desktop hardware.
+//
+//   Maximum supported element count: GROUP_SIZE * GROUP_SIZE = 4096.
+//   (ScanGroupSums is dispatched as a single group of GROUP_SIZE threads,
+//    so it can only scan up to GROUP_SIZE group-totals.)
+
+#pragma kernel BlockReduceKernel
+#pragma kernel GlobalScanKernel
+#pragma kernel BlockScanKernel
+#pragma kernel ChainedScanKernel
+
+// Force DXC (DirectX Shader Compiler) instead of the legacy FXC.
+// Required for SM 6.x: without this Unity defaults to FXC (max SM 5.1),
+// which does not recognise any Wave Intrinsic functions.
+#pragma require wavebasic
+#pragma require waveballot
+#pragma require waveshuffle
+#pragma use_dxc
+#pragma enable_d3d11_debug_symbols   // embeds -Zi -Od debug info into DXC bytecode (works for DX12)
+
+#pragma multi_compile _ UNITY_DEVICE_SUPPORTS_WAVE_ANY
+
+#include "WaveCommon.hlsl"
+// ────────────────────────────────────────────────────────────────────────────
+// Buffers & uniforms  (each kernel only accesses what it needs;
+// the compiler will include only the referenced bindings per-kernel)
+// ────────────────────────────────────────────────────────────────────────────
+
+StructuredBuffer<uint> gInput;
+RWStructuredBuffer<uint> gblockSum;
+RWStructuredBuffer<uint> gOutput;
+
+RWStructuredBuffer<uint> gblockState;
+// one uint per block, represent the state of current block
+// || 2bits - states || 30bits - sum ||
+// states: 00 - X not available, 01 - A block sum avaiialbe, 10 - P prefix sum available
+
+uint gElementCount;
+uint gBlockCount;
+
+uint gCurrentDigitPlace;
+
+/////////////////////////////////////////
+////////// three passes scan //////////
+////////////////////////////////////////
+
+groupshared uint sMemReduce[MAX_WAVES];
+groupshared uint sWarpSum[MAX_WAVES];
+groupshared uint sBlockSum;
+//groupshared uint sWarpSum[MAX_WAVES];
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void BlockReduceKernel(uint3 threadIdx : SV_GroupThreadID,
+    uint3 blockIdx : SV_GroupID)
+{
+    uint idx = threadIdx.x + blockIdx.x * GROUP_SIZE;
+
+    uint value = idx < gElementCount ? gInput[idx] : 0;
+    uint sum = WaveActiveSum(value);
+
+    if (WaveIsFirstLane())
+        sMemReduce[threadIdx.x / WaveGetLaneCount()] = sum;
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    uint blockSum = 0;
+    // first wave
+    bool isFirstWave = (threadIdx.x / WaveGetLaneCount() == 0);
+    if (isFirstWave)
+    {
+        uint blockVal = threadIdx.x < MAX_WAVES ? sMemReduce[threadIdx.x] : 0;
+        blockSum = WaveActiveSum(blockVal);
+    }
+    
+    if (threadIdx.x == 0)
+        gblockSum[blockIdx.x] = blockSum;
+
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void GlobalScanKernel(uint3 threadIdx : SV_GroupThreadID,
+    uint3 blockIdx : SV_GroupID)
+{
+    uint idx = threadIdx.x + blockIdx.x * GROUP_SIZE;
+
+    uint value = idx < gBlockCount ? gblockSum[idx] : 0;
+    uint pfx = WavePrefixSum(value); //exclusive prefixsum
+    if (WaveGetLaneIndex() == (WaveGetLaneCount() - 1))
+        sWarpSum[threadIdx.x / WaveGetLaneCount()] = pfx + value;
+       
+    GroupMemoryBarrierWithGroupSync();
+
+    bool isFirstWave = (threadIdx.x / WaveGetLaneCount() == 0);
+    if (isFirstWave)
+    {
+        uint warpInclusive = threadIdx.x < MAX_WAVES ? sWarpSum[threadIdx.x] : 0;
+        uint warpPfx = WavePrefixSum(warpInclusive);
+        if (threadIdx.x < MAX_WAVES)
+            sWarpSum[threadIdx.x] = warpPfx;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (idx < gBlockCount)
+        gblockSum[idx] = sWarpSum[threadIdx.x / WaveGetLaneCount()] + pfx;
+}
+
+[numthreads(GROUP_SIZE, 1,1)]
+void BlockScanKernel(uint3 threadIdx : SV_GroupThreadID,
+    uint3 blockIdx : SV_GroupID)
+{
+    if (threadIdx.x == 0)
+        sBlockSum = gblockSum[blockIdx.x];
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint idx = threadIdx.x + blockIdx.x * GROUP_SIZE;
+
+    uint value = idx < gElementCount ? gInput[idx] : 0;
+    
+    uint pfx = BlockScanInclusive(threadIdx.x, value);
+
+    if (idx < gElementCount)
+        gOutput[idx] = sBlockSum + pfx;
+}
+
+/////////////////////////////////////////
+////////// one pass scan /////////////
+////////////////////////////////////////
+
+groupshared uint blockPfx;
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ChainedScanKernel(
+    uint3 threadIdx : SV_GroupThreadID,
+    uint3 blockIdx : SV_GroupID)
+{
+    uint idx = threadIdx.x + blockIdx.x * GROUP_SIZE;
+    uint value = idx < gElementCount ? gInput[idx] : 0;
+
+    uint blockSum = BlockReduce(threadIdx.x, value);
+
+     //update block state with atomic operation
+    if (threadIdx.x == 0)
+    {
+        uint flag = blockIdx.x == 0 ? 2 : 1; //first block can directly mark prefix sum available
+        uint state = PackBlockState(flag, blockSum); //mark block sum available
+        uint prevState;
+        InterlockedExchange(gblockState[blockIdx.x], state, prevState);
+    }
+
+    uint exclusivePfx = 0;
+    // decoupled lookback
+    if (threadIdx.x == 0)
+    {
+        int lookbackIdx = blockIdx.x - 1;
+        uint state = 0;
+
+        while(lookbackIdx >= 0)
+        {
+            while (true)
+            {
+                InterlockedAdd(gblockState[lookbackIdx], 0, state); //read state with atomic operation       
+                if (state != 0)
+                    break;
+            }
+            uint flag = UnpackBlockFlag(state);
+            exclusivePfx += UnpackBlockSum(state);
+            if (flag == 2) //prefix sum available
+            {
+                break;
+            }
+            else if (flag == 1) //block sum available, but prefix sum not available yet
+            {
+                lookbackIdx = lookbackIdx - 1;
+            }
+        }
+        uint currState = PackBlockState(2, exclusivePfx + blockSum); //mark prefix sum available
+        uint prevState;
+        InterlockedExchange(gblockState[blockIdx.x], currState, prevState);
+
+        blockPfx = exclusivePfx;
+    }   
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    uint pfx = BlockScanInclusive(threadIdx.x, value);
+    
+    if (idx < gElementCount)
+        gOutput[idx] = blockPfx + pfx;
+}
+

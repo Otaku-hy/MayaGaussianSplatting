@@ -1,0 +1,144 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel PreprocessKernel
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+StructuredBuffer<float3> gPositionWS;
+StructuredBuffer<float3> gScale;
+StructuredBuffer<float4> gRotation; //quaternions
+StructuredBuffer<float> gOpacity;
+StructuredBuffer<float3> gSHsCoeff;
+
+RWStructuredBuffer<float2> gPositionSS;
+RWStructuredBuffer<float> gDepth;
+RWStructuredBuffer<float> gRadius;
+RWStructuredBuffer<float3> gColor;
+RWStructuredBuffer<float4> gCov2D_opcacity;
+
+
+cbuffer PreprocessParams
+{
+    float4x4 viewMat;
+    float4x4 projMat;
+
+    float3 cameraPos;
+    float padding;
+
+    float2 tanHalfFov;
+    int filmWidth;
+    int filmHeight;
+}
+
+uint gGaussCounts;
+
+inline float3x3 Get3DCovariance(float3 scale, float4 rotation)
+{
+    float3x3 rotMat = float3x3(
+        1 - 2 * rotation.y * rotation.y - 2 * rotation.z * rotation.z, 2 * rotation.x * rotation.y - 2 * rotation.w * rotation.z, 2 * rotation.x * rotation.z + 2 * rotation.w * rotation.y,
+        2 * rotation.x * rotation.y + 2 * rotation.w * rotation.z, 1 - 2 * rotation.x * rotation.x - 2 * rotation.z * rotation.z, 2 * rotation.y * rotation.z - 2 * rotation.w * rotation.x,
+        2 * rotation.x * rotation.z - 2 * rotation.w * rotation.y, 2 * rotation.y * rotation.z + 2 * rotation.w * rotation.x, 1 - 2 * rotation.x * rotation.x - 2 * rotation.y * rotation.y
+    );
+
+    float3x3 scaleMat = float3x3(
+        scale.x * scale.x, 0, 0,
+        0, scale.y * scale.y, 0,
+        0, 0, scale.z * scale.z
+    );
+
+    return mul(rotMat, mul(scaleMat, transpose(rotMat)));
+}
+
+inline float2 Get2DCovariance(float3x3 cov3D, float3x4 viewMat, float3 mean, float2 focus)
+{
+    const float covExtensionFactorMax = 0.65f;
+
+    float3 meanVS = mul(viewMat, float4(mean, 1.0)).xyz;
+
+    // adjust scale factor for gauss outside screen
+    float xExtentMax = covExtensionFactorMax / focus.x;
+    float yExtentMax = covExtensionFactorMax / focus.y;
+    float xExtent = meanVS.x / meanVS.z;
+    float yExtent = meanVS.y / meanVS.z;
+    meanVS.x = min(xExtentMax, max(-xExtentMax, xExtent)) * meanVS.z;
+    meanVS.y = min(yExtentMax, max(-yExtentMax, yExtent)) * meanVS.z;
+    
+    float3x3 jacobian  = float3x3(
+        focus.x * meanVS.x / meanVS.z, 0, -focus.x * meanVS.x / (meanVS.z * meanVS.z),
+        focus.y * meanVS.y / meanVS.z, 0, -focus.y * meanVS.y / (meanVS.z * meanVS.z),
+        0, 0, 1
+    );
+
+    float3x3 viewProj = (float3x3)mul(jacobian, viewMat);
+    float3x3 cov2D = mul(viewProj, mul(cov3D, transpose(viewProj)));
+
+    return float3(cov2D[0][0] + 0.3f, cov2D[0][1], cov2D[1][1] + 0.3f);
+}
+
+inline float3 ComputeSphericalHarmonics(uint idx, float3 position, float3 cameraPos)
+{
+    uint shBaseIdx = idx * 16; // 16 coeffs for each point
+    float3 dir = normalize(position - cameraPos);
+
+    float3 shColor = gSHsCoeff[shBaseIdx + 0] * 0.282095f; // L00
+    
+    shColor += gSHsCoeff[shBaseIdx + 1] * -0.488603f * dir.y; // L1-1
+    shColor += gSHsCoeff[shBaseIdx + 2] * 0.488603f * dir.z; // L10
+    shColor += gSHsCoeff[shBaseIdx + 3] * -0.488603f * dir.x; // L11
+
+    shColor += gSHsCoeff[shBaseIdx + 4] * 1.092548 * dir.x * dir.y; // L2-2
+    shColor += gSHsCoeff[shBaseIdx + 5] * -1.092548 * dir.y * dir.z; // L2-1
+    shColor += gSHsCoeff[shBaseIdx + 6] * 0.315392 * (3 * dir.z * dir.z - 1); // L20
+    shColor += gSHsCoeff[shBaseIdx + 7] * -1.092548 * dir.x * dir.z; // L21
+    shColor += gSHsCoeff[shBaseIdx + 8] * 0.546274 * (dir.x * dir.x - dir.y * dir.y); // L22
+
+    shColor += gSHsCoeff[shBaseIdx + 9] * -0.590044 * dir.y * (3 * dir.x * dir.x - dir.y * dir.y); // L3-3
+    shColor += gSHsCoeff[shBaseIdx + 10] * 2.890611 * dir.x * dir.y * dir.z; // L3-2
+    shColor += gSHsCoeff[shBaseIdx + 11] * -0.457046 * dir.y * (5 * dir.z * dir.z - 1); // L3-1
+    shColor += gSHsCoeff[shBaseIdx + 12] * 0.373176 * (5 * dir.z * dir.z * dir.z - 3 * dir.z); // L30
+    shColor += gSHsCoeff[shBaseIdx + 13] * -0.457046 * dir.x * (5 * dir.z * dir.z - 1); // L31
+    shColor += gSHsCoeff[shBaseIdx + 14] * 1.445305 * dir.z * (dir.x * dir.x - dir.y * dir.y); // L32
+    shColor += gSHsCoeff[shBaseIdx + 15] * -0.590044 * dir.x * (dir.x * dir.x - 3 * dir.y * dir.y); // L33
+
+    shColor += 0.5f;
+    return max(shColor, 1.0f);
+}
+
+[numthreads(256,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= gGaussCounts)
+        return;
+
+
+    float3 positionWS = gPositionWS[id.x];
+    float4 positionVS = mul(viewMat, float4(positionWS, 1.0f));
+
+// clip position
+    if (positionVS.z <= 0)
+    {
+        gRadius[id.x] = 0;
+        return;
+    }
+
+    float4 positionCS = mul(projMat, positionVS);
+    float2 positionNDC = positionCS.xy / positionCS.w ;
+    float2 positionSS = (positionNDC * 0.5f + 0.5f) * float2(filmWidth, filmHeight);
+
+    float3x3 cov3D = Get3DCovariance(gScale[id.x], gRotation[id.x]);
+    float3 cov2D = Get2DCovariance(cov3D, (float3x4) viewMat, positionWS, tanHalfFov);
+    
+    float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    float middle = (cov2D.x + cov2D.z) * 0.5;
+    float radius = middle + sqrt(max(0.01, middle * middle - det));
+    radius = ceil(3.0f * sqrt(radius));
+
+    float3 invCov2D = float3(cov2D.z, -cov2D.y, cov2D.x) / det;
+
+    float3 color = ComputeSphericalHarmonics(id.x, positionWS, cameraPos);
+
+    gPositionSS[id.x] = positionSS;
+    gDepth[id.x] = positionCS.z / positionCS.w;
+    gRadius[id.x] = radius;
+    gColor[id.x] = color;
+    gCov2D_opcacity[id.x] = float4(invCov2D, gOpacity[id.x]);
+}
