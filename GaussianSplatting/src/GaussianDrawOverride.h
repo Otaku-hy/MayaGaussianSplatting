@@ -172,12 +172,8 @@ public:
 
     MHWRender::DrawAPI supportedDrawAPIs() const override;
 
-    // Drawn in the transparent pass so opaque Maya geometry depth is already
-    // present in the depth buffer, enabling correct mutual occlusion.
-    bool isTransparent() const override { return true; }
-
-    bool         isBounded(const MDagPath& objPath, const MDagPath&) const override;
-    MBoundingBox boundingBox(const MDagPath& objPath, const MDagPath&) const override;
+    bool         isBounded(const MDagPath&, const MDagPath&) const override { return false; }
+    MBoundingBox boundingBox(const MDagPath&, const MDagPath&) const override { return {}; }
 
     MUserData* prepareForDraw(const MDagPath&                   objPath,
                               const MDagPath&                   cameraPath,

@@ -36,10 +36,6 @@ struct GaussianData {
     //   groups 1..15  = f_rest_0..44  (may be zeroed if PLY has no higher-order SH)
     std::vector<float> shCoeffs;    // float3 × 16 × N = 48 floats per splat
 
-    // Axis-aligned bounding box (object space), filled by buildGPUArrays()
-    float bboxMin[3] = { 0.f, 0.f, 0.f };
-    float bboxMax[3] = { 0.f, 0.f, 0.f };
-
     size_t count() const { return splats.size(); }
     bool   empty() const { return splats.empty(); }
 

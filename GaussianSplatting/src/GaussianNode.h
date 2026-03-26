@@ -3,7 +3,6 @@
 #include <maya/MString.h>
 #include <maya/MTypeId.h>
 #include <maya/MObject.h>
-#include <maya/MBoundingBox.h>
 
 class GaussianDataNode;
 
@@ -24,8 +23,7 @@ public:
 
     MStatus compute(const MPlug& plug, MDataBlock& dataBlock) override;
 
-    bool         isBounded()   const override { return true; }
-    MBoundingBox boundingBox() const override;
+    bool isBounded() const override { return false; }
 
     // Static identifiers
     static MTypeId typeId;

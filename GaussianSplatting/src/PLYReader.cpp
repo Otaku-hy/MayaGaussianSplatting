@@ -31,9 +31,6 @@ static inline float quatLen(const float q[4]) {
 void GaussianData::buildGPUArrays() {
     const size_t N = splats.size();
 
-    bboxMin[0] = bboxMin[1] = bboxMin[2] =  1e30f;
-    bboxMax[0] = bboxMax[1] = bboxMax[2] = -1e30f;
-
     positions.clear();   positions.reserve(N * 3);
     colors.clear();      colors.reserve(N * 4);
     scaleWS.clear();     scaleWS.reserve(N * 3);
@@ -46,11 +43,6 @@ void GaussianData::buildGPUArrays() {
         positions.push_back(s.position[0]);
         positions.push_back(s.position[1]);
         positions.push_back(s.position[2]);
-
-        for (int k = 0; k < 3; ++k) {
-            if (s.position[k] < bboxMin[k]) bboxMin[k] = s.position[k];
-            if (s.position[k] > bboxMax[k]) bboxMax[k] = s.position[k];
-        }
 
         colors.push_back(shToLinear(s.f_dc[0]));
         colors.push_back(shToLinear(s.f_dc[1]));

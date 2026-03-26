@@ -69,28 +69,6 @@ MStatus GaussianDataNode::compute(const MPlug& plug, MDataBlock& dataBlock) {
             if (PLYReader::read(newPath.asChar(), m_data, err)) {
                 MGlobal::displayInfo(MString("[GaussianSplatData] Loaded ") +
                                      (unsigned int)m_data.count() + " splats.");
-
-                // --- Scale diagnostics (visible in Script Editor) ---
-                if (!m_data.scaleWS.empty()) {
-                    float sMin = 1e30f, sMax = -1e30f, sSum = 0.f;
-                    int   allOnes = 0;
-                    for (float v : m_data.scaleWS) {
-                        if (v < sMin) sMin = v;
-                        if (v > sMax) sMax = v;
-                        sSum += v;
-                        if (v > 0.999f && v < 1.001f) allOnes++;
-                    }
-                    float avg = sSum / (float)m_data.scaleWS.size();
-                    bool  missingScale = (allOnes == (int)m_data.scaleWS.size());
-
-                    MString ms("[GaussianSplatData] Scale (after exp): min=");
-                    ms += sMin; ms += " max="; ms += sMax;
-                    ms += " avg="; ms += avg;
-                    if (missingScale)
-                        ms += "  <<< ALL 1.0 — PLY likely missing scale_0/1/2, splats will be 1m radius! >>>";
-                    MGlobal::displayInfo(ms);
-                }
-
                 m_inputsDirty = true;
             } else {
                 MGlobal::displayError(MString("[GaussianSplatData] ") + err.c_str());
@@ -180,15 +158,3 @@ bool GaussianDataNode::uploadInputBuffersIfNeeded(ID3D11Device* device)
 }
 
 #undef SAFE_RELEASE
-
-// ---------------------------------------------------------------------------
-// boundingBox  --  object-space AABB of the loaded splats
-// ---------------------------------------------------------------------------
-MBoundingBox GaussianDataNode::boundingBox() const
-{
-    if (m_data.empty())
-        return MBoundingBox(MPoint(-1, -1, -1), MPoint(1, 1, 1));
-    return MBoundingBox(
-        MPoint(m_data.bboxMin[0], m_data.bboxMin[1], m_data.bboxMin[2]),
-        MPoint(m_data.bboxMax[0], m_data.bboxMax[1], m_data.bboxMax[2]));
-}

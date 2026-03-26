@@ -288,12 +288,10 @@ void PreprocessKernel(uint3 id : SV_DispatchThreadID)
     float2 posNDC = posCS.xy / posCS.w;
     float2 posSS  = (posNDC * 0.5f + 0.5f) * float2((float)filmWidth, (float)filmHeight);
 
-    // Object-space 3D covariance, then transform to world space.
-    // Maya row-major: posWS = posOS * worldMat, so column-vec rotation = worldMat^T.
-    // cov_WS = worldMat^T * cov_obj * worldMat
+    // Object-space 3D covariance, then transform to world space
     float3x3 cov3D_obj = Get3DCovariance(gScale[id.x], gRotation[id.x]);
     float3x3 W3x3      = (float3x3)worldMat;
-    float3x3 cov3D     = mul(transpose(W3x3), mul(cov3D_obj, W3x3));
+    float3x3 cov3D     = mul(W3x3, mul(cov3D_obj, transpose(W3x3)));
 
     float3   cov2D = Get2DCovariance(cov3D, posVS.xyz);
 
@@ -914,21 +912,6 @@ GaussianDrawOverride::GaussianDrawOverride(const MObject& obj)
 MHWRender::DrawAPI GaussianDrawOverride::supportedDrawAPIs() const
 {
     return MHWRender::kDirectX11;
-}
-
-bool GaussianDrawOverride::isBounded(const MDagPath& objPath, const MDagPath&) const
-{
-    if (!m_node) return false;
-    GaussianDataNode* dn = m_node->findConnectedDataNode();
-    return (dn && dn->hasData());
-}
-
-MBoundingBox GaussianDrawOverride::boundingBox(const MDagPath& objPath, const MDagPath&) const
-{
-    if (!m_node) return MBoundingBox(MPoint(-1,-1,-1), MPoint(1,1,1));
-    GaussianDataNode* dn = m_node->findConnectedDataNode();
-    if (!dn || !dn->hasData()) return MBoundingBox(MPoint(-1,-1,-1), MPoint(1,1,1));
-    return dn->boundingBox();
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,6 @@
 #include <maya/MString.h>
 #include <maya/MTypeId.h>
 #include <maya/MObject.h>
-#include <maya/MBoundingBox.h>
 #include <d3d11.h>
 #include <cstdint>
 
@@ -40,7 +39,6 @@ public:
     const GaussianData& gaussianData() const { return m_data; }
     uint32_t            splatCount()   const { return (uint32_t)m_data.count(); }
     bool                hasData()      const { return !m_data.empty(); }
-    MBoundingBox        boundingBox()  const;   // object-space bbox of loaded splats
 
     // GPU input buffer management (lazy upload, called from prepareForDraw)
     bool uploadInputBuffersIfNeeded(ID3D11Device* device);

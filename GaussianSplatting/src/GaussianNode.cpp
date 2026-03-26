@@ -59,13 +59,6 @@ MStatus GaussianNode::compute(const MPlug& /*plug*/, MDataBlock& /*dataBlock*/) 
 // ---------------------------------------------------------------------------
 // findConnectedDataNode  --  walk the inputData plug to find the upstream node
 // ---------------------------------------------------------------------------
-MBoundingBox GaussianNode::boundingBox() const {
-    GaussianDataNode* dn = findConnectedDataNode();
-    if (!dn || !dn->hasData())
-        return MBoundingBox(MPoint(-1, -1, -1), MPoint(1, 1, 1));
-    return dn->boundingBox();
-}
-
 GaussianDataNode* GaussianNode::findConnectedDataNode() const {
     MPlug inputPlug(thisMObject(), aInputData);
     MPlugArray sources;
