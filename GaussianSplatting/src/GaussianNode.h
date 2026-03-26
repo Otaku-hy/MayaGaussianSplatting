@@ -3,24 +3,29 @@
 #include <maya/MString.h>
 #include <maya/MTypeId.h>
 #include <maya/MObject.h>
-#include "GaussianData.h"
+#include <maya/MBoundingBox.h>
+
+class GaussianDataNode;
 
 // ---------------------------------------------------------------------------
-// GaussianNode  —  MPxLocatorNode that holds a loaded .ply file.
+// GaussianNode  --  MPxLocatorNode that renders Gaussian splats.
 //
-// Attributes exposed in Maya:
-//   filePath  (string)  –  path to the .ply Gaussian splatting file
-//   pointSize (float)   –  debug display point radius in pixels
+// This node no longer loads PLY data itself. Instead, it connects to a
+// GaussianDataNode via the inputData message attribute.
 //
-// GaussianDrawOverride accesses m_data directly (declared friend).
+// Attributes:
+//   inputData  (message) -- connect from GaussianDataNode.outputData
+//   pointSize  (float)   -- debug display point radius in pixels
 // ---------------------------------------------------------------------------
 class GaussianNode : public MPxLocatorNode {
 public:
     static void*   creator();
     static MStatus initialize();
 
-    // Locator does not have a meaningful bounding box for now
-    bool isBounded() const override { return false; }
+    MStatus compute(const MPlug& plug, MDataBlock& dataBlock) override;
+
+    bool         isBounded()   const override { return true; }
+    MBoundingBox boundingBox() const override;
 
     // Static identifiers
     static MTypeId typeId;
@@ -29,16 +34,13 @@ public:
     static MString drawRegistrantId;
 
     // Maya attributes
-    static MObject aFilePath;
+    static MObject aInputData;   // message attribute, connected from data node
     static MObject aPointSize;
+    static MObject aRenderMode;  // 0=auto, 1=debug, 2=production
 
-    // Read-only access for the geometry override
-    const GaussianData& gaussianData()  const { return m_data; }
-    const MString&      loadedPath()    const { return m_loadedPath; }
+    // Find the upstream GaussianDataNode via the inputData connection
+    GaussianDataNode* findConnectedDataNode() const;
 
 private:
-    GaussianData m_data;
-    MString      m_loadedPath;   // last successfully attempted path
-
     friend class GaussianDrawOverride;
 };

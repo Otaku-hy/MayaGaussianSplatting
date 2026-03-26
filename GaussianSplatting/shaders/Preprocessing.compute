@@ -16,20 +16,23 @@ RWStructuredBuffer<float3> gColor;
 RWStructuredBuffer<float4> gCov2D_opcacity;
 
 
-cbuffer PreprocessParams
+cbuffer PreprocessParams : register(b0)
 {
     float4x4 viewMat;
     float4x4 projMat;
 
     float3 cameraPos;
-    float padding;
+    float padding0;
 
     float2 tanHalfFov;
     int filmWidth;
     int filmHeight;
-}
 
-uint gGaussCounts;
+    uint gGaussCounts;
+    float pad1;
+    float pad2;
+    float pad3;
+}
 
 inline float3x3 Get3DCovariance(float3 scale, float4 rotation)
 {
@@ -48,7 +51,7 @@ inline float3x3 Get3DCovariance(float3 scale, float4 rotation)
     return mul(rotMat, mul(scaleMat, transpose(rotMat)));
 }
 
-inline float2 Get2DCovariance(float3x3 cov3D, float3x4 viewMat, float3 mean, float2 focus)
+inline float3 Get2DCovariance(float3x3 cov3D, float3x4 viewMat, float3 mean, float2 focus)
 {
     const float covExtensionFactorMax = 0.65f;
 
@@ -100,11 +103,11 @@ inline float3 ComputeSphericalHarmonics(uint idx, float3 position, float3 camera
     shColor += gSHsCoeff[shBaseIdx + 15] * -0.590044 * dir.x * (dir.x * dir.x - 3 * dir.y * dir.y); // L33
 
     shColor += 0.5f;
-    return max(shColor, 1.0f);
+    return max(shColor, 0.0f);
 }
 
 [numthreads(256,1,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+void PreprocessKernel (uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= gGaussCounts)
         return;
