@@ -13,11 +13,7 @@
 class GaussianNode;
 
 // ===========================================================================
-// GaussianDrawData  --  owns per-render-node DX11 resources.
-//
-// Input StructuredBuffers now live in GaussianDataNode (shared).
-// This class holds non-owning SRV pointers copied each frame, plus
-// per-instance compute outputs, sort buffers, and pipeline state.
+// GaussianDrawData  --  owns all DX11 resources for one render node.
 // ===========================================================================
 class GaussianDrawData : public MUserData {
 public:
@@ -33,21 +29,20 @@ public:
     float        projMat[16]  = {};
     float        cameraPos[3] = {};
     float        tanHalfFov[2]= {};
-    float        pointSize    = 4.f;
+    float        pointSize    = 10.f;
     float        vpWidth      = 1280.f;
     float        vpHeight     = 720.f;
     unsigned int vertexCount  = 0;
-    int          renderMode   = 0;   // 0=auto, 1=debug, 2=production
 
     // -----------------------------------------------------------------------
-    // Debug pipeline  (VS+GS+PS, reads from shared StructuredBuffers)
+    // Debug pipeline  (VS+GS+PS, reads raw input SRVs)
     // -----------------------------------------------------------------------
     ID3D11VertexShader*    dbgVS         = nullptr;
     ID3D11GeometryShader*  dbgGS         = nullptr;
     ID3D11PixelShader*     dbgPS         = nullptr;
     ID3D11Buffer*          dbgCB         = nullptr;
 
-    // Shared render states (used by both debug and production)
+    // Shared render states
     ID3D11BlendState*      blendState    = nullptr;
     ID3D11RasterizerState* rsState       = nullptr;
     ID3D11DepthStencilState* dsState     = nullptr;
@@ -55,25 +50,31 @@ public:
     bool dbgReady = false;
 
     // -----------------------------------------------------------------------
-    // Non-owning references to shared input SRVs (from GaussianDataNode).
-    // Refreshed every frame in prepareForDraw. Do NOT Release() these.
+    // Input StructuredBuffers (owned, uploaded from GaussianNode::m_data)
     // -----------------------------------------------------------------------
-    ID3D11ShaderResourceView* sharedSrvPositionWS = nullptr;
-    ID3D11ShaderResourceView* sharedSrvScale      = nullptr;
-    ID3D11ShaderResourceView* sharedSrvRotation   = nullptr;
-    ID3D11ShaderResourceView* sharedSrvOpacity    = nullptr;
-    ID3D11ShaderResourceView* sharedSrvSHCoeffs   = nullptr;
-    bool inputsReady = false;
+    ID3D11Buffer*             sbPositionWS  = nullptr;
+    ID3D11ShaderResourceView* srvPositionWS = nullptr;
+    ID3D11Buffer*             sbScale       = nullptr;
+    ID3D11ShaderResourceView* srvScale      = nullptr;
+    ID3D11Buffer*             sbRotation    = nullptr;
+    ID3D11ShaderResourceView* srvRotation   = nullptr;
+    ID3D11Buffer*             sbOpacity     = nullptr;
+    ID3D11ShaderResourceView* srvOpacity    = nullptr;
+    ID3D11Buffer*             sbSHCoeffs    = nullptr;
+    ID3D11ShaderResourceView* srvSHCoeffs   = nullptr;
+
+    bool     inputsReady = false;
+    MString  loadedPath;            // path that was uploaded
 
     // -----------------------------------------------------------------------
-    // Production pipeline  (Compute preprocess + ellipse render)
+    // Production pipeline  (Compute preprocess + sort + render)
     // -----------------------------------------------------------------------
 
     // -- Compute shader --
     ID3D11ComputeShader*   computeShader = nullptr;
     ID3D11Buffer*          computeCB     = nullptr;
 
-    // -- Output UAVs (written by compute each frame) --
+    // -- Compute output UAVs --
     ID3D11Buffer*              ubPositionSS = nullptr;
     ID3D11UnorderedAccessView* uavPositionSS= nullptr;
     ID3D11ShaderResourceView*  srvPositionSS= nullptr;
@@ -94,8 +95,9 @@ public:
     ID3D11UnorderedAccessView* uavCov2D     = nullptr;
     ID3D11ShaderResourceView*  srvCov2D     = nullptr;
 
-    // -- Render shader --
+    // -- Render shader (VS + GS + PS, one vertex per splat) --
     ID3D11VertexShader*    prodVS    = nullptr;
+    ID3D11GeometryShader*  prodGS    = nullptr;
     ID3D11PixelShader*     prodPS    = nullptr;
     ID3D11Buffer*          prodCB    = nullptr;
 
@@ -103,7 +105,7 @@ public:
     uint32_t allocatedN = 0;
 
     // -----------------------------------------------------------------------
-    // GPU Radix Sort pipeline  (CS 5.0, no wave intrinsics)
+    // GPU Radix Sort pipeline  (CS 5.0)
     // -----------------------------------------------------------------------
     ID3D11ComputeShader*       sortCS_keygen    = nullptr;
     ID3D11ComputeShader*       sortCS_count     = nullptr;
@@ -132,14 +134,15 @@ public:
     bool sortReady = false;
 
     // -----------------------------------------------------------------------
-    // Init / upload helpers
+    // Init helpers
     // -----------------------------------------------------------------------
     bool initDebugPipeline(ID3D11Device* device);
     bool initProductionPipeline(ID3D11Device* device);
     bool initSortPipeline(ID3D11Device* device);
     bool createSortBuffers(ID3D11Device* device, uint32_t N);
-
     bool createComputeOutputs(ID3D11Device* device, uint32_t N);
+
+    bool uploadInputBuffers(ID3D11Device* device, const GaussianData& data);
 
     void releaseAll();
 
@@ -147,6 +150,7 @@ private:
     void releaseDebugResources();
     void releaseProductionResources();
     void releaseSortResources();
+    void releaseInputBuffers();
 
     bool createUAVBuffer(ID3D11Device* device,
                          const char*   name,
@@ -155,6 +159,14 @@ private:
                          ID3D11Buffer**              outBuf,
                          ID3D11UnorderedAccessView** outUAV,
                          ID3D11ShaderResourceView**  outSRV);
+
+    static bool createSRVBuffer(ID3D11Device* device,
+                                const char*   name,
+                                const void*   initData,
+                                uint32_t      numElements,
+                                uint32_t      stride,
+                                ID3D11Buffer**             outBuf,
+                                ID3D11ShaderResourceView** outSRV);
 
     GaussianDrawData(const GaussianDrawData&)            = delete;
     GaussianDrawData& operator=(const GaussianDrawData&) = delete;

@@ -8,7 +8,7 @@ echo Building GaussianSplatting plugin...
 echo MAYA_LOCATION=%MAYA_LOCATION%
 echo DEVKIT_LOCATION=%DEVKIT_LOCATION%
 
-"%MSBUILD%" "%SLN%" /p:Configuration=Release /p:Platform=x64 /p:MAYA_LOCATION="%MAYA_LOCATION%" /p:DEVKIT_LOCATION="%DEVKIT_LOCATION%" /v:m
+"%MSBUILD%" "%SLN%" /p:Configuration=Release /p:Platform=x64 /v:m
 
 if %ERRORLEVEL%==0 (
     echo.

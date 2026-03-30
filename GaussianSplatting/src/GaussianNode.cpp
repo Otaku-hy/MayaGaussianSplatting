@@ -1,9 +1,10 @@
 #include "GaussianNode.h"
-#include "GaussianDataNode.h"
-#include <maya/MFnMessageAttribute.h>
+#include "PLYReader.h"
+#include <maya/MFnTypedAttribute.h>
 #include <maya/MFnNumericAttribute.h>
-#include <maya/MFnDependencyNode.h>
-#include <maya/MPlugArray.h>
+#include <maya/MFnStringData.h>
+#include <maya/MFnData.h>
+#include <maya/MPlug.h>
 #include <maya/MGlobal.h>
 
 // ---------------------------------------------------------------------------
@@ -14,58 +15,55 @@ MString GaussianNode::typeName             { "gaussianSplat" };
 MString GaussianNode::drawDbClassification { "drawdb/geometry/gaussianSplat" };
 MString GaussianNode::drawRegistrantId     { "gaussianSplatPlugin" };
 
-MObject GaussianNode::aInputData;
+MObject GaussianNode::aFilePath;
 MObject GaussianNode::aPointSize;
-MObject GaussianNode::aRenderMode;
 
 // ---------------------------------------------------------------------------
 void* GaussianNode::creator() { return new GaussianNode(); }
 
 MStatus GaussianNode::initialize() {
-    MFnMessageAttribute mAttr;
+    MFnTypedAttribute   tAttr;
     MFnNumericAttribute nAttr;
 
-    // inputData  --  message connection from GaussianDataNode
-    aInputData = mAttr.create("inputData", "id");
-    mAttr.setStorable(false);
-    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aInputData));
+    // filePath — must supply MFnStringData default so it appears in AE
+    MFnStringData stringDataFn;
+    MObject defaultStr = stringDataFn.create("");
+    aFilePath = tAttr.create("filePath", "fp", MFnData::kString, defaultStr);
+    tAttr.setStorable(true);
+    tAttr.setUsedAsFilename(true);
+    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aFilePath));
 
     // pointSize
-    aPointSize = nAttr.create("pointSize", "ps", MFnNumericData::kFloat, 4.0f);
-    nAttr.setMin(0.5f);
-    nAttr.setMax(64.0f);
+    aPointSize = nAttr.create("pointSize", "ps", MFnNumericData::kFloat, 10.0f);
+    nAttr.setMin(1.0f);
+    nAttr.setMax(200.0f);
     nAttr.setStorable(true);
     nAttr.setKeyable(true);
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aPointSize));
-
-    // renderMode  (0=auto, 1=debug, 2=production)
-    aRenderMode = nAttr.create("renderMode", "rm", MFnNumericData::kInt, 0);
-    nAttr.setMin(0);
-    nAttr.setMax(3);
-    nAttr.setStorable(true);
-    nAttr.setKeyable(true);
-    CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aRenderMode));
 
     return MS::kSuccess;
 }
 
 // ---------------------------------------------------------------------------
-// compute  --  nothing to compute; this node is a pure locator
+// reloadIfNeeded  --  compare current filePath attr with m_loadedPath
 // ---------------------------------------------------------------------------
-MStatus GaussianNode::compute(const MPlug& /*plug*/, MDataBlock& /*dataBlock*/) {
-    return MS::kUnknownParameter;
-}
+void GaussianNode::reloadIfNeeded() {
+    MPlug fpPlug(thisMObject(), aFilePath);
+    MString currentPath = fpPlug.asString();
 
-// ---------------------------------------------------------------------------
-// findConnectedDataNode  --  walk the inputData plug to find the upstream node
-// ---------------------------------------------------------------------------
-GaussianDataNode* GaussianNode::findConnectedDataNode() const {
-    MPlug inputPlug(thisMObject(), aInputData);
-    MPlugArray sources;
-    inputPlug.connectedTo(sources, true /*asDst*/, false /*asSrc*/);
+    if (currentPath == m_loadedPath) return;
 
-    if (sources.length() == 0) return nullptr;
+    m_data.clear();
+    m_loadedPath = currentPath;
 
-    MFnDependencyNode fn(sources[0].node());
-    return dynamic_cast<GaussianDataNode*>(fn.userNode());
+    if (currentPath.length() == 0) return;
+
+    std::string err;
+    if (PLYReader::read(currentPath.asChar(), m_data, err)) {
+        MGlobal::displayInfo(MString("[GaussianSplat] Loaded ") +
+                             (unsigned int)m_data.count() + " splats from " + currentPath);
+    } else {
+        MGlobal::displayError(MString("[GaussianSplat] PLY load failed: ") + err.c_str());
+        m_loadedPath = "";
+    }
 }

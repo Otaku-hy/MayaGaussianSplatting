@@ -1,6 +1,5 @@
 #include "GaussianDrawOverride.h"
 #include "GaussianNode.h"
-#include "GaussianDataNode.h"
 
 #include <maya/MDagPath.h>
 #include <maya/MFnDependencyNode.h>
@@ -86,7 +85,7 @@ float4 PS(GS_OUT i) : SV_Target
 )HLSL";
 
 // ===========================================================================
-// Production pipeline HLSL  (ellipse Gaussian splat, depth-sorted)
+// Production pipeline HLSL  (ellipse Gaussian splat, depth-sorted, VS+GS+PS)
 // ===========================================================================
 static const char* kProdShaderSrc = R"HLSL(
 StructuredBuffer<float2> gPositionSS    : register(t0);
@@ -102,57 +101,82 @@ cbuffer CBRender : register(b0)
     float2 pad;
 };
 
-struct PS_IN {
-    float4 clipPos  : SV_Position;
-    float3 color    : COLOR0;
-    float  opacity  : TEXCOORD3;
-    float2 pixelOff : TEXCOORD0;
-    float3 invCov2D : TEXCOORD1;
+// VS output / GS input: one record per splat
+struct VS_OUT {
+    float4 dummy       : SV_Position;  // required semantic; unused by GS
+    float2 posSS       : TEXCOORD0;
+    float  radius      : TEXCOORD1;
+    float3 color       : COLOR0;
+    float4 cov4        : TEXCOORD2;    // (invCovA, invCovB, invCovC, opacity_raw)
+    float  depth       : TEXCOORD3;
+};
+
+// GS output / PS input: one record per quad corner
+struct GS_OUT {
+    float4 clipPos     : SV_Position;
+    float3 color       : COLOR0;
+    float  opacity_raw : TEXCOORD3;
+    float2 pixelOff    : TEXCOORD0;
+    float3 invCov2D    : TEXCOORD1;
 };
 
 float sigmoid_approx(float x) { return 1.0f / (1.0f + exp(-x)); }
 
-// Instanced rendering: 4 vertices per splat (triangle strip quad), no GS.
-// SV_VertexID  = corner index (0..3)
-// SV_InstanceID = splat draw order (0..N-1, maps to sorted index)
-PS_IN VS(uint cornerID : SV_VertexID, uint iid : SV_InstanceID)
+// VS: one invocation per sorted splat
+VS_OUT VS(uint vid : SV_VertexID)
 {
-    PS_IN o = (PS_IN)0;
+    VS_OUT o = (VS_OUT)0;
+    uint idx    = gSortedIndices[vid];
+    o.posSS     = gPositionSS[idx];
+    o.radius    = gRadius[idx];
+    o.color     = gColor[idx];
+    o.cov4      = gCov2D_Opacity[idx];
+    o.depth     = gDepth[idx];
+    o.dummy     = float4(0, 0, 0, 1);
+    return o;
+}
 
-    uint idx = gSortedIndices[iid];
-    float r  = gRadius[idx];
+// GS: expand each splat point to a screen-aligned quad
+[maxvertexcount(4)]
+void GS(point VS_OUT input[1], inout TriangleStream<GS_OUT> stream)
+{
+    float r = input[0].radius;
+    if (r <= 0.0f) return;
 
-    if (r <= 0.0f) { o.clipPos = float4(0, 0, -2, 1); return o; }
-
-    float2 spos  = gPositionSS[idx];
-    float3 col   = gColor[idx];
-    float4 cov4  = gCov2D_Opacity[idx];
-    float  depth = gDepth[idx];
-
+    float2 spos = input[0].posSS;
+    // Screen pixel coords -> NDC (flip Y: screen Y grows down, NDC Y grows up)
     float2 ndc = spos / gViewportSize * 2.0f - 1.0f;
+    ndc.y = -ndc.y;
+    float depth = input[0].depth;
+
+    float2 halfNDC = float2(r / gViewportSize.x, r / gViewportSize.y) * 2.0f;
 
     static const float2 corners[4] = {
         float2(-1.f,  1.f), float2( 1.f,  1.f),
         float2(-1.f, -1.f), float2( 1.f, -1.f),
     };
-    float2 corner  = corners[cornerID];
-    float2 halfNDC = float2(r / gViewportSize.x, r / gViewportSize.y) * 2.0f;
 
-    o.clipPos   = float4(ndc + corner * halfNDC, depth, 1.0f);
-    o.color     = col;
-    o.opacity   = sigmoid_approx(cov4.w);
-    o.pixelOff  = corner * r;
-    o.invCov2D  = cov4.xyz;
-    return o;
+    GS_OUT o;
+    o.color       = input[0].color;
+    o.opacity_raw = input[0].cov4.w;
+    o.invCov2D    = input[0].cov4.xyz;
+
+    [unroll]
+    for (int k = 0; k < 4; k++) {
+        o.clipPos  = float4(ndc + corners[k] * halfNDC, depth, 1.0f);
+        o.pixelOff = corners[k] * r;
+        stream.Append(o);
+    }
+    stream.RestartStrip();
 }
 
-float4 PS(PS_IN i) : SV_Target
+float4 PS(GS_OUT i) : SV_Target
 {
     float x = i.pixelOff.x, y = i.pixelOff.y;
     float a = i.invCov2D.x, b = i.invCov2D.y, c = i.invCov2D.z;
     float power = -0.5f * (a*x*x + 2.0f*b*x*y + c*y*y);
     if (power > 0.0f) discard;
-    float alpha = i.opacity * exp(power);
+    float alpha = sigmoid_approx(i.opacity_raw) * exp(power);
     if (alpha < 1.0f / 255.0f) discard;
     return float4(i.color, alpha);
 }
@@ -239,32 +263,10 @@ float3 Get2DCovariance(float3x3 cov3D, float3 meanVS)
     return float3(cov[0][0] + 0.3f, cov[0][1], cov[1][1] + 0.3f);
 }
 
-float3 ComputeSphericalHarmonics(uint idx, float3 position, float3 camPos)
+float3 ComputeSphericalHarmonics(uint idx)
 {
-    uint shBaseIdx = idx * 16;
-    float3 dir = normalize(position - camPos);
-
-    float3 shColor = gSHsCoeff[shBaseIdx + 0] * 0.282095f;
-
-    shColor += gSHsCoeff[shBaseIdx + 1] * -0.488603f * dir.y;
-    shColor += gSHsCoeff[shBaseIdx + 2] *  0.488603f * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 3] * -0.488603f * dir.x;
-
-    shColor += gSHsCoeff[shBaseIdx + 4] *  1.092548f * dir.x * dir.y;
-    shColor += gSHsCoeff[shBaseIdx + 5] * -1.092548f * dir.y * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 6] *  0.315392f * (3.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 7] * -1.092548f * dir.x * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 8] *  0.546274f * (dir.x * dir.x - dir.y * dir.y);
-
-    shColor += gSHsCoeff[shBaseIdx + 9]  * -0.590044f * dir.y * (3.0f * dir.x * dir.x - dir.y * dir.y);
-    shColor += gSHsCoeff[shBaseIdx + 10] *  2.890611f * dir.x * dir.y * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 11] * -0.457046f * dir.y * (5.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 12] *  0.373176f * (5.0f * dir.z * dir.z * dir.z - 3.0f * dir.z);
-    shColor += gSHsCoeff[shBaseIdx + 13] * -0.457046f * dir.x * (5.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 14] *  1.445305f * dir.z * (dir.x * dir.x - dir.y * dir.y);
-    shColor += gSHsCoeff[shBaseIdx + 15] * -0.590044f * dir.x * (dir.x * dir.x - 3.0f * dir.y * dir.y);
-
-    shColor += 0.5f;
+    // Degree-0 (DC) only
+    float3 shColor = gSHsCoeff[idx * 16] * 0.282095f + 0.5f;
     return max(shColor, 0.0f);
 }
 
@@ -307,8 +309,7 @@ void PreprocessKernel(uint3 id : SV_DispatchThreadID)
 
     float3 invCov = float3(cov2D.z, -cov2D.y, cov2D.x) / det;
 
-    // SH evaluated in world space
-    float3 color = ComputeSphericalHarmonics(id.x, posWS, cameraPos);
+    float3 color = ComputeSphericalHarmonics(id.x);
 
     gPositionSS[id.x]    = posSS;
     gDepth[id.x]         = posCS.z / posCS.w;
@@ -553,10 +554,68 @@ void GaussianDrawData::releaseAll()
 {
     releaseDebugResources();
     releaseProductionResources();
-    // shared SRV pointers are non-owning; just null them
-    sharedSrvPositionWS = sharedSrvScale = sharedSrvRotation = nullptr;
-    sharedSrvOpacity = sharedSrvSHCoeffs = nullptr;
+    releaseInputBuffers();
+}
+
+void GaussianDrawData::releaseInputBuffers()
+{
+    SAFE_RELEASE(sbPositionWS); SAFE_RELEASE(srvPositionWS);
+    SAFE_RELEASE(sbScale);      SAFE_RELEASE(srvScale);
+    SAFE_RELEASE(sbRotation);   SAFE_RELEASE(srvRotation);
+    SAFE_RELEASE(sbOpacity);    SAFE_RELEASE(srvOpacity);
+    SAFE_RELEASE(sbSHCoeffs);   SAFE_RELEASE(srvSHCoeffs);
     inputsReady = false;
+}
+
+bool GaussianDrawData::createSRVBuffer(ID3D11Device* device,
+                                        const char*   name,
+                                        const void*   initData,
+                                        uint32_t      numElements,
+                                        uint32_t      stride,
+                                        ID3D11Buffer**             outBuf,
+                                        ID3D11ShaderResourceView** outSRV)
+{
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth           = numElements * stride;
+    bd.Usage               = D3D11_USAGE_DEFAULT;
+    bd.BindFlags           = D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = stride;
+
+    D3D11_SUBRESOURCE_DATA init = { initData, 0, 0 };
+    HRESULT hr = device->CreateBuffer(&bd, initData ? &init : nullptr, outBuf);
+    if (FAILED(hr)) {
+        MGlobal::displayError(MString("[GaussianSplat] CreateBuffer(SRV) failed for '") + name + "'.");
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.ViewDimension         = D3D11_SRV_DIMENSION_BUFFEREX;
+    srvd.BufferEx.FirstElement = 0;
+    srvd.BufferEx.NumElements  = numElements;
+    hr = device->CreateShaderResourceView(*outBuf, &srvd, outSRV);
+    if (FAILED(hr)) {
+        MGlobal::displayError(MString("[GaussianSplat] CreateSRV failed for '") + name + "'.");
+        SAFE_RELEASE(*outBuf);
+        return false;
+    }
+    return true;
+}
+
+bool GaussianDrawData::uploadInputBuffers(ID3D11Device* device, const GaussianData& data)
+{
+    releaseInputBuffers();
+    uint32_t N = (uint32_t)data.count();
+
+    if (!createSRVBuffer(device, "positionWS", data.positions.data(),  N, sizeof(float)*3, &sbPositionWS, &srvPositionWS)) return false;
+    if (!createSRVBuffer(device, "scale",      data.scaleWS.data(),    N, sizeof(float)*3, &sbScale,      &srvScale))      return false;
+    if (!createSRVBuffer(device, "rotation",   data.rotationWS.data(), N, sizeof(float)*4, &sbRotation,   &srvRotation))   return false;
+    if (!createSRVBuffer(device, "opacity",    data.opacityRaw.data(), N, sizeof(float),   &sbOpacity,    &srvOpacity))    return false;
+    if (!createSRVBuffer(device, "shCoeffs",   data.shCoeffs.data(), N * kSHCoeffsPerSplat, sizeof(float)*3, &sbSHCoeffs, &srvSHCoeffs)) return false;
+
+    inputsReady = true;
+    MGlobal::displayInfo(MString("[GaussianSplat] Input buffers uploaded: ") + N + " splats.");
+    return true;
 }
 
 void GaussianDrawData::releaseDebugResources()
@@ -581,6 +640,7 @@ void GaussianDrawData::releaseProductionResources()
     SAFE_RELEASE(ubColor);       SAFE_RELEASE(uavColor);      SAFE_RELEASE(srvColor);
     SAFE_RELEASE(ubCov2D);       SAFE_RELEASE(uavCov2D);      SAFE_RELEASE(srvCov2D);
     SAFE_RELEASE(prodVS);
+    SAFE_RELEASE(prodGS);
     SAFE_RELEASE(prodPS);
     SAFE_RELEASE(prodCB);
     releaseSortResources();
@@ -756,13 +816,16 @@ bool GaussianDrawData::initProductionPipeline(ID3D11Device* device)
         if (FAILED(hr)) return false;
     }
 
-    // -- Compile render shaders (VS + PS only, no GS — instanced rendering) --
+    // -- Compile render shaders (VS + GS + PS) --
     size_t srcLen = strlen(kProdShaderSrc);
-    ID3DBlob* vsBlob = nullptr, *psBlob = nullptr;
+    ID3DBlob* vsBlob = nullptr, *gsBlob = nullptr, *psBlob = nullptr;
     if (!CompileStage(kProdShaderSrc, srcLen, "VS", "vs_5_0", &vsBlob)) goto prod_fail;
-    if (!CompileStage(kProdShaderSrc, srcLen, "PS", "ps_5_0", &psBlob)) { vsBlob->Release(); goto prod_fail; }
+    if (!CompileStage(kProdShaderSrc, srcLen, "GS", "gs_5_0", &gsBlob)) { vsBlob->Release(); goto prod_fail; }
+    if (!CompileStage(kProdShaderSrc, srcLen, "PS", "ps_5_0", &psBlob)) { vsBlob->Release(); gsBlob->Release(); goto prod_fail; }
 
     hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &prodVS);
+    if (FAILED(hr)) goto prod_blob_cleanup;
+    hr = device->CreateGeometryShader(gsBlob->GetBufferPointer(), gsBlob->GetBufferSize(), nullptr, &prodGS);
     if (FAILED(hr)) goto prod_blob_cleanup;
     hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &prodPS);
     if (FAILED(hr)) goto prod_blob_cleanup;
@@ -777,12 +840,12 @@ bool GaussianDrawData::initProductionPipeline(ID3D11Device* device)
         if (FAILED(hr)) goto prod_blob_cleanup;
     }
 
-    vsBlob->Release(); psBlob->Release();
+    vsBlob->Release(); gsBlob->Release(); psBlob->Release();
     prodReady = true;
     return true;
 
 prod_blob_cleanup:
-    vsBlob->Release(); psBlob->Release();
+    vsBlob->Release(); gsBlob->Release(); psBlob->Release();
 prod_fail:
     MGlobal::displayError("[GaussianSplat] Production pipeline init failed.");
     return false;
@@ -950,42 +1013,25 @@ MUserData* GaussianDrawOverride::prepareForDraw(
             MGlobal::displayError("[GaussianSplat] Sort pipeline: FAILED");
     }
 
-    // Find connected data node
-    GaussianDataNode* dataNode = m_node->findConnectedDataNode();
+    // Reload PLY if filePath changed
+    m_node->reloadIfNeeded();
 
-    // Clear shared SRV refs each frame (re-fetch below if data node exists)
-    data->sharedSrvPositionWS = nullptr;
-    data->sharedSrvScale      = nullptr;
-    data->sharedSrvRotation   = nullptr;
-    data->sharedSrvOpacity    = nullptr;
-    data->sharedSrvSHCoeffs   = nullptr;
-    data->inputsReady         = false;
-    data->vertexCount         = 0;
+    data->vertexCount = 0;
+    if (!m_node->hasData()) return data;
 
-    if (!dataNode) return data;
-
-    // Trigger data node compute (DG evaluation)
-    MPlug dataReadyPlug(dataNode->thisMObject(), GaussianDataNode::aDataReady);
-    dataReadyPlug.asBool();
-
-    if (!dataNode->hasData()) return data;
-
-    // Lazy GPU upload of shared input buffers (in data node)
-    if (device) {
-        dataNode->uploadInputBuffersIfNeeded(device);
+    // Upload input GPU buffers if PLY data changed
+    MPlug fpPlug(m_node->thisMObject(), GaussianNode::aFilePath);
+    MString currentPath = fpPlug.asString();
+    if (device && currentPath != data->loadedPath) {
+        if (data->uploadInputBuffers(device, m_node->gaussianData()))
+            data->loadedPath = currentPath;
+        else
+            return data;
     }
 
-    if (!dataNode->areInputsReady()) return data;
+    if (!data->inputsReady) return data;
 
-    // Copy non-owning SRV pointers from data node
-    data->sharedSrvPositionWS = dataNode->srvPositionWS();
-    data->sharedSrvScale      = dataNode->srvScale();
-    data->sharedSrvRotation   = dataNode->srvRotation();
-    data->sharedSrvOpacity    = dataNode->srvOpacity();
-    data->sharedSrvSHCoeffs   = dataNode->srvSHCoeffs();
-    data->inputsReady         = true;
-
-    uint32_t N = dataNode->splatCount();
+    uint32_t N = m_node->splatCount();
     data->vertexCount = N;
 
     // Allocate per-instance compute outputs + sort buffers if count changed
@@ -1032,10 +1078,6 @@ MUserData* GaussianDrawOverride::prepareForDraw(
     MPlug psPlug(m_node->thisMObject(), GaussianNode::aPointSize);
     data->pointSize = psPlug.asFloat();
 
-    // Render mode (0=auto, 1=debug, 2=production)
-    MPlug rmPlug(m_node->thisMObject(), GaussianNode::aRenderMode);
-    data->renderMode = rmPlug.asInt();
-
     // One-time diagnostic
     {
         static bool diagDone = false;
@@ -1044,47 +1086,9 @@ MUserData* GaussianDrawOverride::prepareForDraw(
             MString msg("[GaussianSplat] DIAG: prodReady=");
             msg += (int)data->prodReady;
             msg += " sortReady=";   msg += (int)data->sortReady;
-            msg += " dbgReady=";    msg += (int)data->dbgReady;
             msg += " inputsReady="; msg += (int)data->inputsReady;
-            msg += " allocatedN=";  msg += data->allocatedN;
-            msg += " vertexCount="; msg += data->vertexCount;
-            msg += " sortValsA=";   msg += (data->sortValsA_SRV ? "yes" : "null");
+            msg += " N=";           msg += data->vertexCount;
             MGlobal::displayInfo(msg);
-
-            // Matrix diagnostics
-            MString m2("[GaussianSplat] projMat diag: ");
-            m2 += data->projMat[0]; m2 += ", ";
-            m2 += data->projMat[5]; m2 += ", ";
-            m2 += data->projMat[10]; m2 += ", ";
-            m2 += data->projMat[15];
-            MGlobal::displayInfo(m2);
-
-            MString m3("[GaussianSplat] tanHalfFov: ");
-            m3 += data->tanHalfFov[0]; m3 += ", ";
-            m3 += data->tanHalfFov[1];
-            m3 += " viewport: ";
-            m3 += data->vpWidth; m3 += "x"; m3 += data->vpHeight;
-            MGlobal::displayInfo(m3);
-
-            MString m4("[GaussianSplat] viewMat row2: ");
-            m4 += data->viewMat[8]; m4 += ", ";
-            m4 += data->viewMat[9]; m4 += ", ";
-            m4 += data->viewMat[10]; m4 += ", ";
-            m4 += data->viewMat[11];
-            MGlobal::displayInfo(m4);
-
-            MString m5("[GaussianSplat] cameraPos: ");
-            m5 += data->cameraPos[0]; m5 += ", ";
-            m5 += data->cameraPos[1]; m5 += ", ";
-            m5 += data->cameraPos[2];
-            MGlobal::displayInfo(m5);
-
-            // Focal length check
-            float focalX = 0.5f * data->vpWidth / data->tanHalfFov[0];
-            float focalY = 0.5f * data->vpHeight / data->tanHalfFov[1];
-            MString m6("[GaussianSplat] focalPx: ");
-            m6 += focalX; m6 += ", "; m6 += focalY;
-            MGlobal::displayInfo(m6);
         }
     }
 
@@ -1137,24 +1141,16 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
                    && data->sortValsA_SRV;
     bool canDbg  = data->dbgReady && data->inputsReady;
 
-    bool useProd = false;
-    if (data->renderMode == 1)      useProd = false;         // force debug
-    else if (data->renderMode == 2) useProd = canProd;       // force production
-    else if (data->renderMode == 3) useProd = canProd;       // diagnostic: prod with fixed radius
-    else                            useProd = canProd;       // auto
+    bool useProd = canProd;  // auto: use production when available
 
     // One-time draw-path diagnostic
     {
         static int drawDiagCount = 0;
-        if (drawDiagCount < 3) {
+        if (drawDiagCount < 2) {
             drawDiagCount++;
-            MString msg("[GaussianSplat] DRAW frame ");
-            msg += drawDiagCount;
-            msg += ": useProd="; msg += (int)useProd;
-            msg += " canProd=";  msg += (int)canProd;
-            msg += " canDbg=";   msg += (int)canDbg;
-            msg += " renderMode="; msg += data->renderMode;
-            msg += " N=";       msg += data->vertexCount;
+            MString msg("[GaussianSplat] DRAW: useProd=");
+            msg += (int)useProd;
+            msg += " N="; msg += data->vertexCount;
             MGlobal::displayInfo(msg);
         }
     }
@@ -1181,7 +1177,7 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
                 cb->filmWidth   = (int)data->vpWidth;
                 cb->filmHeight  = (int)data->vpHeight;
                 cb->gaussCount  = N;
-                cb->debugFixedRadius = (data->renderMode == 3) ? 5 : 0;
+                cb->debugFixedRadius = (uint32_t)std::max(1.0f, data->pointSize);
                 cb->pad2 = cb->pad3 = 0.f;
                 ctx->Unmap(data->computeCB, 0);
             }
@@ -1190,8 +1186,8 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
         // -- 2. Dispatch Preprocessing compute shader --
         {
             ID3D11ShaderResourceView* srvs[] = {
-                data->sharedSrvPositionWS, data->sharedSrvScale, data->sharedSrvRotation,
-                data->sharedSrvOpacity, data->sharedSrvSHCoeffs
+                data->srvPositionWS, data->srvScale, data->srvRotation,
+                data->srvOpacity, data->srvSHCoeffs
             };
             ID3D11UnorderedAccessView* uavs[] = {
                 data->uavPositionSS, data->uavDepth, data->uavRadius,
@@ -1308,23 +1304,25 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
             }
         }
 
-        // -- 5. Render pass (sorted via gSortedIndices SRV) --
+        // -- 5. Render pass (VS+GS+PS: one vertex per splat, GS expands to quad) --
         {
             ID3D11ShaderResourceView* vsSRVs[] = {
                 data->srvPositionSS, data->srvRadius, data->srvColor,
                 data->srvCov2D, data->srvDepth, data->sortValsA_SRV
             };
             ctx->IASetInputLayout(nullptr);
-            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
             ctx->VSSetShader(data->prodVS, nullptr, 0);
             ctx->VSSetConstantBuffers(0, 1, &data->prodCB);
             ctx->VSSetShaderResources(0, 6, vsSRVs);
-            ctx->GSSetShader(nullptr, nullptr, 0);
+            ctx->GSSetShader(data->prodGS, nullptr, 0);
+            ctx->GSSetConstantBuffers(0, 1, &data->prodCB);
             ctx->PSSetShader(data->prodPS, nullptr, 0);
-            ctx->DrawInstanced(4, N, 0, 0);
+            ctx->Draw(N, 0);
 
             ID3D11ShaderResourceView* nullSRVs6[6] = {};
             ctx->VSSetShaderResources(0, 6, nullSRVs6);
+            ctx->GSSetShader(nullptr, nullptr, 0);
         }
     }
     // -----------------------------------------------------------------------
@@ -1346,9 +1344,8 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
             }
         }
 
-        // Bind shared StructuredBuffers as VS SRVs
         ID3D11ShaderResourceView* vsSRVs[] = {
-            data->sharedSrvPositionWS, data->sharedSrvOpacity, data->sharedSrvSHCoeffs
+            data->srvPositionWS, data->srvOpacity, data->srvSHCoeffs
         };
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);

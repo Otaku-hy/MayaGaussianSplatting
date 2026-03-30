@@ -3,25 +3,19 @@
 #include <maya/MString.h>
 #include <maya/MTypeId.h>
 #include <maya/MObject.h>
-
-class GaussianDataNode;
+#include "GaussianData.h"
 
 // ---------------------------------------------------------------------------
-// GaussianNode  --  MPxLocatorNode that renders Gaussian splats.
-//
-// This node no longer loads PLY data itself. Instead, it connects to a
-// GaussianDataNode via the inputData message attribute.
+// GaussianNode  --  MPxLocatorNode that holds a loaded .ply file.
 //
 // Attributes:
-//   inputData  (message) -- connect from GaussianDataNode.outputData
-//   pointSize  (float)   -- debug display point radius in pixels
+//   filePath  (string)  --  path to the .ply Gaussian splatting file
+//   pointSize (float)   --  splat display radius in pixels
 // ---------------------------------------------------------------------------
 class GaussianNode : public MPxLocatorNode {
 public:
     static void*   creator();
     static MStatus initialize();
-
-    MStatus compute(const MPlug& plug, MDataBlock& dataBlock) override;
 
     bool isBounded() const override { return false; }
 
@@ -32,13 +26,20 @@ public:
     static MString drawRegistrantId;
 
     // Maya attributes
-    static MObject aInputData;   // message attribute, connected from data node
+    static MObject aFilePath;
     static MObject aPointSize;
-    static MObject aRenderMode;  // 0=auto, 1=debug, 2=production
 
-    // Find the upstream GaussianDataNode via the inputData connection
-    GaussianDataNode* findConnectedDataNode() const;
+    // Read-only access for the draw override
+    const GaussianData& gaussianData() const { return m_data; }
+    uint32_t            splatCount()   const { return (uint32_t)m_data.count(); }
+    bool                hasData()      const { return !m_data.empty(); }
+
+    // Load PLY from the current filePath attribute (called by DrawOverride)
+    void reloadIfNeeded();
 
 private:
+    GaussianData m_data;
+    MString      m_loadedPath;
+
     friend class GaussianDrawOverride;
 };

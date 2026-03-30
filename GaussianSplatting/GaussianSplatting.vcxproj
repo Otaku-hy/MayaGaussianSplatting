@@ -94,7 +94,9 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\GaussianDataNode.cpp" />
+    <ClCompile Include="src\GaussianDataNode.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\GaussianDrawOverride.cpp" />
     <ClCompile Include="src\GaussianNode.cpp" />
     <ClCompile Include="src\plugin_main.cpp" />
