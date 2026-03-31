@@ -25,12 +25,10 @@ MStatus GaussianNode::initialize() {
     MFnTypedAttribute   tAttr;
     MFnNumericAttribute nAttr;
 
-    // filePath — must supply MFnStringData default so it appears in AE
-    MFnStringData stringDataFn;
-    MObject defaultStr = stringDataFn.create("");
-    aFilePath = tAttr.create("filePath", "fp", MFnData::kString, defaultStr);
-    tAttr.setStorable(true);
+    // filePath
+    aFilePath = tAttr.create("filePath", "fp", MFnData::kString);
     tAttr.setUsedAsFilename(true);
+    tAttr.setStorable(true);
     CHECK_MSTATUS_AND_RETURN_IT(addAttribute(aFilePath));
 
     // pointSize
