@@ -307,6 +307,16 @@ void PreprocessKernel(uint3 id : SV_DispatchThreadID)
     // Clamp radius to avoid GPU-killing full-screen quads
     if (radius > 1024.0f) { gRadius[id.x] = 0.0f; return; }
 
+    // Screen-space frustum cull: discard if the splat's bounding quad
+    // (center ± radius) lies entirely outside the viewport rectangle.
+    // Saves sort/draw/VS work for off-screen splats.
+    if (posSS.x + radius < 0.0f || posSS.x - radius > (float)filmWidth ||
+        posSS.y + radius < 0.0f || posSS.y - radius > (float)filmHeight)
+    {
+        gRadius[id.x] = 0.0f;
+        return;
+    }
+
     float3 invCov = float3(cov2D.z, -cov2D.y, cov2D.x) / det;
 
     // SH evaluated in world space

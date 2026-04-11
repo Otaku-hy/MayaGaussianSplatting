@@ -4,112 +4,169 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目简介
 
-这是一个 Maya 插件（C++/DX11），用于在 Autodesk Maya 的 Viewport 2.0 中可视化 3D Gaussian Splatting 点云。目前是 alpha/调试原型阶段——着色器是调试用的（点扩展为四边形 + 圆形遮罩），并非完整的生产级 Gaussian Splatting 渲染器。
+这是一个 Maya 插件（C++/DX11），用于在 Autodesk Maya 2026 的 Viewport 2.0 中可视化 3D Gaussian Splatting 点云。当前 master 分支已实现完整的生产级渲染管线：**Compute 预处理 → GPU Radix 排序 → 实例化椭圆 Splat 渲染**，同时保留了简单圆点的 debug 路径。插件同时支持 Maya 几何体深度遮挡和完整 Maya 变换（移动/旋转/缩放）。
 
 ## 构建
 
-**工具链：** Visual Studio 2022，MSBuild，仅支持 x64。无自动化测试或 lint 命令。
+**工具链：** Visual Studio 2022（v143），MSBuild，仅 x64。无自动化测试或 lint。
 
 **构建前必须设置的环境变量：**
 ```
-MAYA_LOCATION    - Maya 安装目录（用于头文件和库的搜索路径）
-DEVKIT_LOCATION  - 编译后 .mll 插件文件的目标目录
+MAYA_LOCATION    — Maya 安装目录（头文件/库搜索路径），例：C:\Program Files\Autodesk\Maya2026
+DEVKIT_LOCATION  — Maya devkit 根目录
 ```
 
-通过以下解决方案文件构建：
-```
-GaussianSplatting/GaussianSplatting.sln
-```
+**解决方案：** `GaussianSplatting/GaussianSplatting.sln`
 
-构建后步骤会将 `.mll` 文件复制到 `$(DEVKIT_LOCATION)\plug-ins\plug-ins\`。
+**本地构建脚本：** 仓库根目录 `_build_tmp.bat`（设置环境变量 + 调用 MSBuild Release|x64）。`build.bat` 是较早的版本。
 
-**Maya 设置：** 需将渲染引擎切换为 DirectX 11：
+**Post-build：** 项目会把 `GaussianSplatting.mll` 复制到仓库根目录（`$(SolutionDir)..\`）。
+
+**Maya 设置：** 必须把 Viewport 2.0 渲染引擎切换为 DirectX 11：
 `Windows → Settings/Preferences → Preferences → Display → Viewport 2.0 → Rendering Engine: DirectX 11`
 
 ## 架构
 
+### 节点设计（v0.2 — 数据/渲染分离）
+
+```
+  gaussianSplatData (MPxNode)            gaussianSplat (MPxLocatorNode)
+  ─────────────────────────              ──────────────────────────────
+  filePath ── attributeAffects ──▶       inputData (message, 连入 DataNode)
+  dataReady (compute 时加载 PLY)          pointSize
+  outputData (message, 输出端)             renderMode (0=auto, 1=debug, 2=prod, 3=prod+fixedRadius)
+  持有 GaussianData + 5 个共享 SRV  ◀─────  引用 DataNode 的 SRV, 由 DrawOverride 渲染
+```
+
+一个 DataNode 可被多个 gaussianSplat 渲染节点连接，PLY 数据和 GPU 输入缓冲（PositionWS/Scale/Rotation/Opacity/SHCoeffs）仅上传一次。
+
 ### 数据流
+
 ```
-PLY 文件 → PLYReader → GaussianData → GaussianNode (MPxLocatorNode)
-                                              ↓
-                                    GaussianDrawOverride (DX11)
-                                              ↓
-                                gaussianDebug.fx 着色器 (VS → GS → PS)
+PLY 文件 ──▶ PLYReader ──▶ GaussianData
+                                │
+                                ▼
+                      GaussianDataNode.compute (DG 触发)
+                                │  uploadInputBuffersIfNeeded
+                                ▼
+         5 个 StructuredBuffer SRV (positionWS/scale/rotation/opacity/shCoeffs)
+                                │  非拥有引用, 每帧从 DataNode 拷贝
+                                ▼
+              GaussianDrawOverride::prepareForDraw
+                                │
+                                ▼
+                  GaussianDrawOverride::draw (DX11)
+                      ┌──────────┴──────────┐
+            Production 路径              Debug 路径
+            (Compute+Sort+Ellipse)       (VS+GS+PS 圆点)
 ```
 
-### 核心模块
+### 核心模块（`GaussianSplatting/src/`）
 
-- **`plugin_main.cpp`** — 插件入口/出口；向 Maya 注册 `gaussianSplat` 节点类型及其绘制覆盖。
-- **`GaussianNode`** — Maya DAG 节点（`MPxLocatorNode`）。持有 `filePath` 和 `pointSize` 属性。属性变更时调用 PLYReader 并存储解析结果。
-- **`GaussianData.h`** — POD 结构体：`GaussianSplat`（单个 splat 的原始数据）和 `GaussianData`（展平后的 GPU 就绪数组）。
-- **`PLYReader`** — 解析 `binary_little_endian` 和 ASCII 格式的 PLY 文件；提取位置、SH DC 系数（f_dc_0–2）、不透明度、缩放和旋转四元数。
-- **`GaussianDrawOverride`** — `MPxDrawOverride` 实现；管理 DX11 设备、顶点/常量缓冲区和着色器管线。这是**当前的活跃渲染路径**。
-- **`GaussianGeometryOverride`** — `MPxGeometryOverride`（较旧的 VP2 API）；保留但已被 `GaussianDrawOverride` 取代。
-- **`gaussianDebug.fx`** — HLSL 着色器：VS 变换顶点位置，GS 将每个点扩展为屏幕对齐的四边形，PS 应用带软边淡出的圆形遮罩。
+| 文件 | 行数 | 说明 |
+|---|---|---|
+| `plugin_main.cpp` | 189 | 注册 2 个节点 + DrawOverride，执行内嵌 MEL 构建 **"Gaussian Splatting" 顶部菜单**（Load PLY / Create Data Node / Create Render Node / Connect Selected） |
+| `GaussianDataNode.{h,cpp}` | 86+194 | `MPxNode`，拥有 `GaussianData` 与 5 个共享 SRV。`compute` 在 `filePath` 变化时调用 PLYReader，打印 scale 诊断（检测缺失 scale_0/1/2 导致的 1m 半径问题） |
+| `GaussianNode.{h,cpp}` | 46+78 | `MPxLocatorNode`，纯渲染代理；通过 `inputData` message attr 连接上游 DataNode；`boundingBox()` 从 DataNode 拿 AABB（支持选择框和视锥剔除） |
+| `GaussianDrawOverride.{h,cpp}` | 194+1398 | **当前活跃渲染路径**。`GaussianDrawData`（MUserData）拥有 per-render-node 的 DX11 资源；`GaussianDrawOverride::draw` 根据 `renderMode` 选择管线。所有 HLSL 作为 `static const char*` 内嵌（见下文）。`isTransparent()` 返回 true 以保证 Maya 几何体先写深度 |
+| `GaussianGeometryOverride.{h,cpp}` | 52+201 | 旧版 `MPxGeometryOverride`，**已保留但未使用**，由 DrawOverride 取代 |
+| `PLYReader.{h,cpp}` | 12+357 | 支持 binary_little_endian 和 ASCII；在 `buildGPUArrays()` 里做：`exp(log_scale)`、四元数归一化、SH 系数从 PLY 的 planar 布局（f_rest[0..44]，所有 r 后所有 g 后所有 b）重新交织为 16 组 float3；同时计算 object-space AABB |
+| `GaussianData.h` | 49 | POD：`GaussianSplat` 原始数据 + `GaussianData` 展平数组（positions/colors/scaleWS/rotationWS/opacityRaw/shCoeffs）+ bbox |
 
-### Maya 插件模式
+### 关键点：Shader 都在 C++ 字符串里
 
-Maya 采用节点与覆盖分离的设计：`GaussianNode` 负责存储数据和属性，`GaussianDrawOverride` 负责所有渲染逻辑。两者通过 `plugin_main.cpp` 中的节点类型注册关联。新增可渲染属性需同时修改两个类，并处理覆盖中的 `prepareForDraw` / `draw` 周期。
+**实际运行的所有 HLSL 代码都以 `static const char*` 内嵌在 `GaussianDrawOverride.cpp` 顶部**，通过 `D3DCompile` 运行时编译：
 
-### 生产级渲染管线（计算着色器，进行中）
+| 变量 | 内容 | 源码位置 |
+|---|---|---|
+| `kDbgShaderSrc` | Debug 路径：VS+GS+PS，圆形 Splat（点→四边形→圆遮罩） | 第 27 行附近 |
+| `kProdShaderSrc` | Production 渲染：VS 实例化（4 顶点/splat 从 `gSortedIndices` 读索引）+ PS（Gaussian 椭圆 alpha） | 第 91 行附近 |
+| `kPreprocessCS` | 预处理 compute shader，`PreprocessKernel` 256 线程/组 | 第 164 行附近 |
+| `kRadixSortCS` | 4 个 radix sort kernel，通过 `#define` 切换：`KEYGEN_KERNEL` / `COUNT_KERNEL` / `SCAN_KERNEL` / `SCATTER_KERNEL` | 第 340 行附近 |
 
-位于 `GaussianSplatting/shaders/`，所有计算着色器均需要 **SM 6.x**（DXC 编译器，`#pragma use_dxc`）和 HLSL Wave Intrinsics。
+**`GaussianSplatting/shaders/` 目录下的 `Preprocessing.compute` 和 `gaussianDebug.fx` 是遗留参考文件，`.vcxproj` 中已标记 `ExcludedFromBuild`，不参与构建**。修改任何 shader 都必须编辑 `GaussianDrawOverride.cpp` 里的字符串常量。
 
-#### `WaveCommon.hlsl` — 共享头文件
-被所有计算着色器 `#include`，提供：
-- **块级 Reduce/Scan**：`BlockReduce`、`BlockScanExclusive`、`BlockScanInclusive`——两级（warp → block）实现，通过 `groupshared` 内存汇聚各 wave 结果
-- **Decoupled Lookback 状态位打包**：`PackBlockState` / `UnpackBlockFlag` / `UnpackBlockSum`——高 2 位存 flag（`01`=块和已就绪，`10`=前缀和已就绪），低 30 位存 sum
-- **WaveMatch 模拟**：`WaveMatch32_8bits`——在不支持 SM 6.5 `WaveMatch` 时对 8-bit key 逐 bit 做 ballot 模拟
-- **直方图工具**：`BuildHistogram`（wave 内 scatter-and-count）、`ScanHistogram`（wave 间扫描）、`BuildHistogramMultiPlace`（一次遍历同时统计 4 个 digit 位）
-- **常量**：`GROUP_SIZE=256`，`MAX_WAVES=8`，`RADIX=8`，`BUCKETS=256`，`SORT_COUNT=4`
+## 渲染管线细节
 
-#### `Preprocessing.compute` — 逐 splat 预处理（`PreprocessKernel`，256 线程/组）
-每帧将原始 PLY 数据转换为 GPU 渲染所需的屏幕空间数据。
+### Production 路径（`renderMode=0` auto 或 `=2` 强制）
 
-| 输入缓冲 | 说明 |
-|---|---|
-| `gPositionWS` | 世界空间位置 float3 |
-| `gScale` | 3 轴缩放 float3 |
-| `gRotation` | 旋转四元数 float4 |
-| `gOpacity` | 原始不透明度（logit 空间）float |
-| `gSHsCoeff` | 球谐系数，每个 splat 16 组 float3（0–3 阶）|
+每帧在 `GaussianDrawOverride::draw` 里执行以下顺序（约第 1180 行起）：
 
-| 输出缓冲 | 说明 |
-|---|---|
-| `gPositionSS` | 屏幕像素坐标 float2 |
-| `gDepth` | NDC 深度（z/w）float |
-| `gRadius` | 像素半径 = `ceil(3√λmax)` float |
-| `gColor` | SH 评估后的 RGB float3 |
-| `gCov2D_opacity` | 逆 2D 协方差 (a,b,c) + opacity，打包为 float4 |
+1. **更新 Preprocess CB**：world/view/proj 矩阵、cameraPos、tanHalfFov、filmW/H、splat 数、`debugFixedRadius`（`renderMode=3` 时设为 5，用于诊断）
+2. **Dispatch `PreprocessKernel`**（256 线程/组，共 `⌈N/256⌉` 组）
+   - 读 5 个输入 SRV（positionWS/scale/rotation/opacity/shCoeffs）
+   - 写 5 个输出 UAV（positionSS/depth/radius/color/cov2D_opacity）
+   - 做 view 空间剔除（`posVS.z >= -0.2` 丢弃）、object→world→view→clip 变换、3D→2D 协方差投影、radius 计算（`ceil(3√λmax)`，上限 1024）、4 阶 SH 求值
+3. **GPU Radix Sort**：
+   - **3a. KeyGen**（256 线程/组）：`gKeysA[i] = ~FloatToSortKey(depth[i])` → 降序 = back-to-front；`gValsA[i] = i`
+   - **3b. 4 趟 8-bit radix**（pass=0..3，`shift = pass*8`），每趟：
+     - **Count**：每 block 一个 256-bucket 直方图 → `gBlockHist[numBlocks×256]`
+     - **Scan**（单组，256 线程）：每 digit 跨 block 做 exclusive prefix sum，再对 digit-total 做 exclusive scan，写回到 `gBlockHist` 作为全局起始偏移
+     - **Scatter**：每个 block 用 `groupshared sLocalRank` + `InterlockedAdd` 局部计数，写到 `gBlockOff + rank` 的输出位置
+     - Ping-pong：even pass A→B，odd pass B→A；4 趟（偶数）后结果在 A
+   - Tile size：`SORT_GROUP_SIZE(256) × ITEMS_PER_THREAD(16) = 4096` 元素/block
+4. **更新 Render CB**（只含 viewport 尺寸）
+5. **DrawInstanced(4, N, 0, 0)**：
+   - 拓扑 `TRIANGLESTRIP`，无 GS，无 InputLayout，无 VB
+   - VS 用 `SV_VertexID`（0..3）作为 quad 角标，`SV_InstanceID` 作为绘制顺序
+   - VS 做 `idx = gSortedIndices[iid]` 查排序后的 splat 索引，然后从 compute 输出 SRV 读取 posSS/radius/color/cov2D/depth
+   - PS 用 inverse 2D covariance 做 EWA Gaussian alpha：`alpha = opacity * exp(-0.5 * (a·x² + 2b·xy + c·y²))`，`< 1/255` 丢弃
 
-关键函数：
-- `Get3DCovariance(scale, quat)` → `R · S² · Rᵀ`（世界空间 3×3 协方差）
-- `Get2DCovariance(cov3D, viewMat, mean, tanHalfFov)` → EWA Jacobian 投影 → 2D 协方差 + 0.3 正则化
-- `ComputeSphericalHarmonics(idx, pos, camPos)` → 沿视线方向评估 0–3 阶 SH（16 系数）
+**CS 5.0 + 无 wave intrinsics**：所有 compute shader 都用 `cs_5_0` target 编译，避免 SM 6.x 依赖。排序靠 `groupshared` + `InterlockedAdd` 实现，不使用 `WaveActiveSum` 等 wave 函数。
 
-**当前代码已知问题：**
-- `Get2DCovariance` 声明返回 `float2`，实际返回 `float3`——类型不匹配
-- `ComputeSphericalHarmonics` 末尾 `max(shColor, 1.0f)` 将最小值钳制为白色，应为 `0.0f`
-- `#pragma kernel PreprocessKernel` 与函数名 `CSMain` 不一致——调度时会找不到入口
+### Debug 路径（`renderMode=1` 或 production fallback）
 
-#### `WaveRadixSort.compute` — GPU 基数排序（用于深度排序）
-对深度 key（uint32）做 8-bit 基数、4 趟的 32-bit 完整排序。
+直接从共享输入 SRV 读 position/opacity/SH[0]：
+- VS：SH degree-0 颜色（`sh[0] * 0.282095 + 0.5`）+ sigmoid opacity
+- GS：每个点扩展为屏幕对齐 quad（`pointSize` 像素）
+- PS：`clip(1 - r²)` 圆形 + 软边淡出
 
-| Kernel | 说明 |
-|---|---|
-| `GlobalHistogramKernel` | 同时统计所有 4 个 digit 位的全局直方图，原子累加到 `gHistogram[BUCKETS×4]` |
-| `GlobalHistogramScanKernel` | 对全局直方图做 exclusive prefix scan → `gHistogramOffset` |
-| `RadixSortNew`（当前使用） | 每线程处理 16 个元素（ITEMS\_PER\_THREAD），decoupled lookback 计算块间偏移，scatter 到 `gOutput` |
-| `RadixSortKernel`（已废弃） | 每线程 1 元素的旧版本，被 `RadixSortNew` 取代 |
+**用途**：快速可视化、检查 PLY 加载是否正确、点大小可在 AE 的 `pointSize` 滑杆上调。
 
-Decoupled Lookback 流程：当前块发布块和（flag=1）→ 扫描前序块 → 获得完整前缀和后升级为（flag=2），后续块可提前终止回溯。
+### Maya 集成要点
 
-#### `WaveScan.compute` — 前缀扫描工具
-排序管线的辅助 kernel，也可独立使用。
+- **`isTransparent() = true`**（`GaussianDrawOverride.h:177`）：让 splat 在透明 pass 绘制，Maya 不透明几何体的深度已经在 depth buffer 里 → 自动正确遮挡
+- **变换支持**：每帧 `objPath.inclusiveMatrix()` 取 `worldMat`，传给 compute shader；shader 内做 `posWS = posOS * worldMat`（Maya row-major 约定）；协方差按 `cov_WS = W^T * cov_obj * W` 变换（`GaussianDrawOverride.cpp:293-296`）
+- **包围盒**：`GaussianData::buildGPUArrays()` 里计算 object-space AABB，`GaussianDataNode::boundingBox()` 暴露给 Maya，支持选择框、视锥剔除、变换手柄自动适配
+- **输入缓冲懒加载**：DataNode 的 DX11 buffer 在首次 `prepareForDraw` 时通过 `uploadInputBuffersIfNeeded` 上传，PLY 切换时自动释放重建
+- **DX11 状态保存/恢复**：`draw()` 开头保存 Maya 的 blend/RS/DS/InputLayout/VS/GS/PS，结尾全部恢复，避免污染 Maya 渲染状态
+- **SH 步长常量**：C++ 用 `kSHCoeffsPerSplat = 16`（`GaussianData.h:6`），作为 debug shader CB 的 `gSHStride` 传入
 
-| Kernel | 说明 |
-|---|---|
-| `BlockReduceKernel` | 每块求和写入 `gblockSum[]` |
-| `GlobalScanKernel` | 对块和做 exclusive scan（单组） |
-| `BlockScanKernel` | 每块 inclusive scan + 加入组偏移 → `gOutput` |
-| `ChainedScanKernel` | 单趟扫描，内置 decoupled lookback，无需单独的全局扫描分发 |
+## 常量与 Magic Number 速查
+
+| 名称 | 值 | 说明 |
+|---|---|---|
+| `kSHCoeffsPerSplat` | 16 | 每 splat 16 组 float3 SH（0–3 阶） |
+| `kSortGroupSize` | 256 | Radix sort 线程组大小 |
+| `kSortItemsPerThread` | 16 | 每线程处理的元素数 |
+| `kSortTileSize` | 4096 | = 256 × 16，每 block 处理的元素数 |
+| `kRadixSize` | 256 | 8-bit radix 桶数 |
+| `PreprocessKernel` 组大小 | 256 | `⌈N/256⌉` dispatch |
+| Radius 上限 | 1024 px | 超过直接剔除，避免 GPU 杀手级全屏 quad |
+| Z 剔除阈值 | `posVS.z >= -0.2` | 近平面之后即剔除（Maya 右手系，负 z 朝前） |
+
+## 常见陷阱
+
+- **"splats 都是 1m 半径"**：PLY 缺少 `scale_0/1/2` 属性（COLMAP sparse 点云），DataNode 会在 Script Editor 打印 `<<< ALL 1.0 — PLY likely missing scale... >>>` 警告。要加载 **训练输出**，比如 `output/<scene>/point_cloud/iteration_30000/point_cloud.ply`，不是 COLMAP 的 sparse/points3D
+- **`shaders/Preprocessing.compute` 与运行版不一致**：磁盘那份是老版本，有 `#pragma kernel` vs 入口名不一致、SH 末尾 `max(..., 1.0)` 写错为 0.0、`Get2DCovariance` 参数错误等问题。**运行时用的是 `kPreprocessCS` 字符串常量**，已修复。请勿拿磁盘的 `.compute` 当作权威源
+- **Rotation 四元数存储顺序**：PLY 里是 `rot_0..rot_3` = `w,x,y,z`；在 HLSL 里 `float4` 读进来后是 `rotation.x=w, .y=x, .z=y, .w=z`（见 `kPreprocessCS` 里 `Get3DCovariance`），和直觉反的，改 shader 时需要注意
+- **`renderMode=3`** 是诊断模式：强制使用 production 路径但覆盖 radius 为固定 5 像素，用来区分"排序错"还是"协方差错"
+- **Sort 准备未就绪时自动回退**：`draw()` 里 `canProd = prodReady && sortReady && inputsReady && allocatedN==vertexCount && sortValsA_SRV`，任一失败就走 debug 路径
+- **PLY 切换 → 重新分配**：`allocatedN != N` 时调用 `createComputeOutputs(device, N)`，会同时重建 sort buffer（keys A/B、vals A/B、blockHist）
+- **编码警告 C4819**：中文注释触发 warning，可忽略
+
+## 菜单用法
+
+加载插件后顶部栏出现 **"Gaussian Splatting"** 菜单：
+
+1. **Load PLY File...**：一键完成 `createNode gaussianSplatData` → 设置 filePath → 创建 transform + gaussianSplat shape → `connectAttr outputData → inputData`
+2. **Create Data Node** / **Create Render Node**：分别创建空节点，方便手动连接多个 render node 到同一 data
+3. **Connect Selected**：选中 data node 再选 render node（或其 transform），点击即完成连接
+
+也可以纯 MEL：
+```mel
+string $d = `createNode gaussianSplatData`;
+setAttr -type "string" ($d + ".filePath") "C:/path/to/point_cloud.ply";
+string $r = `createNode gaussianSplat`;
+connectAttr ($d + ".outputData") ($r + ".inputData");
+```
