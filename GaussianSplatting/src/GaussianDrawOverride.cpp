@@ -482,6 +482,123 @@ void ScatterKernel(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 )HLSL";
 
 // ===========================================================================
+// Depth Pass compute shader  (method B: per-pixel representative depth)
+//
+// Two kernels sharing the same UAV:
+//   ClearDepthKernel  — clears UAV texture to 1.0f (far)
+//   DepthPassKernel   — one thread per splat; iterates the splat's screen
+//                       AABB and atomic-mins its NDC depth into every pixel
+//                       where the Gaussian alpha exceeds the threshold.
+//
+// Result is an R32_UINT texture where each pixel stores asuint(nearestDepth).
+// The copy pass then writes those values into Maya's real depth buffer.
+// ===========================================================================
+static const char* kDepthPassCS = R"HLSL(
+cbuffer DepthCB : register(b0)
+{
+    uint  gViewportW;
+    uint  gViewportH;
+    uint  gSplatCount;
+    uint  gRadiusCap;
+    float gAlphaThreshold;
+    float gDpadA, gDpadB, gDpadC;
+};
+
+RWTexture2D<uint> gDepthUAV : register(u0);
+
+#ifdef CLEAR_DEPTH_KERNEL
+[numthreads(16, 16, 1)]
+void ClearDepthKernel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= gViewportW || id.y >= gViewportH) return;
+    gDepthUAV[id.xy] = asuint(1.0f);
+}
+#endif
+
+#ifdef DEPTH_PASS_KERNEL
+StructuredBuffer<float2> gPositionSS   : register(t0);
+StructuredBuffer<float>  gRadius       : register(t1);
+StructuredBuffer<float>  gDepth        : register(t2);
+StructuredBuffer<float4> gCov2DOpacity : register(t3);
+
+float sigmoid_approx(float x) { return 1.0f / (1.0f + exp(-x)); }
+
+[numthreads(256, 1, 1)]
+void DepthPassKernel(uint3 id : SV_DispatchThreadID)
+{
+    uint sidx = id.x;
+    if (sidx >= gSplatCount) return;
+
+    float r = gRadius[sidx];
+    if (r <= 0.0f) return;   // already culled (near plane / off-screen / degenerate)
+
+    float  depth  = gDepth[sidx];
+    if (depth <= 0.0f || depth >= 1.0f) return;  // behind camera or at far
+
+    float4 cov4   = gCov2DOpacity[sidx];
+    float  opacity = sigmoid_approx(cov4.w);
+    if (opacity < gAlphaThreshold) return;       // skip barely-visible splats
+
+    float2 center = gPositionSS[sidx];
+
+    // Cap iteration area to bound per-thread work. Very large splats only
+    // contribute depth inside a capped region around their center.
+    float rCapped = min(r, (float)gRadiusCap);
+
+    int minX = max(0, (int)floor(center.x - rCapped));
+    int maxX = min((int)gViewportW - 1, (int)ceil (center.x + rCapped));
+    int minY = max(0, (int)floor(center.y - rCapped));
+    int maxY = min((int)gViewportH - 1, (int)ceil (center.y + rCapped));
+    if (minX > maxX || minY > maxY) return;
+
+    uint  depthBits = asuint(depth);
+    float a = cov4.x, b = cov4.y, c = cov4.z;
+
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
+            float dx = (float)x + 0.5f - center.x;
+            float dy = (float)y + 0.5f - center.y;
+            float power = -0.5f * (a*dx*dx + 2.0f*b*dx*dy + c*dy*dy);
+            if (power > 0.0f) continue;
+            float alpha = opacity * exp(power);
+            if (alpha < gAlphaThreshold) continue;
+
+            // asuint preserves ordering for positive floats; NDC depth in [0,1]
+            // so InterlockedMin gives us the nearest contributing splat.
+            InterlockedMin(gDepthUAV[uint2(x, y)], depthBits);
+        }
+    }
+}
+#endif
+)HLSL";
+
+// ===========================================================================
+// Depth Copy shader  (full-screen triangle, writes SV_Depth from UAV texture)
+// ===========================================================================
+static const char* kDepthCopyShader = R"HLSL(
+Texture2D<uint> gDepthSrc : register(t0);
+
+struct VS_OUT { float4 pos : SV_Position; };
+
+VS_OUT CopyVS(uint vid : SV_VertexID)
+{
+    // Full-screen triangle (covers NDC [-1,1]^2 with one triangle)
+    VS_OUT o;
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    o.pos = float4(uv * 2.0f - 1.0f, 0.0f, 1.0f);
+    o.pos.y = -o.pos.y;
+    return o;
+}
+
+void CopyPS(VS_OUT i, out float outDepth : SV_Depth)
+{
+    uint2 pix = uint2(i.pos.xy);
+    uint  bits = gDepthSrc.Load(int3(pix, 0));
+    outDepth = asfloat(bits);
+}
+)HLSL";
+
+// ===========================================================================
 // Constant buffer layouts (must match HLSL)
 // ===========================================================================
 static const uint32_t kSortGroupSize     = 256;
@@ -525,6 +642,16 @@ struct CBSort {
 };
 static_assert(sizeof(CBSort) % 16 == 0, "");
 
+struct CBDepth {
+    uint32_t viewportW;
+    uint32_t viewportH;
+    uint32_t splatCount;
+    uint32_t radiusCap;
+    float    alphaThreshold;
+    float    pad0, pad1, pad2;
+};
+static_assert(sizeof(CBDepth) % 16 == 0, "");
+
 // ===========================================================================
 // Utility: compile a shader stage
 // ===========================================================================
@@ -565,6 +692,7 @@ void GaussianDrawData::releaseAll()
 {
     releaseDebugResources();
     releaseProductionResources();
+    releaseDepthPassResources();
     // shared SRV pointers are non-owning; just null them
     sharedSrvPositionWS = sharedSrvScale = sharedSrvRotation = nullptr;
     sharedSrvOpacity = sharedSrvSHCoeffs = nullptr;
@@ -611,6 +739,22 @@ void GaussianDrawData::releaseSortResources()
     SAFE_RELEASE(sortValsB); SAFE_RELEASE(sortValsB_UAV); SAFE_RELEASE(sortValsB_SRV);
     SAFE_RELEASE(sortBlockHist); SAFE_RELEASE(sortBlockHist_UAV); SAFE_RELEASE(sortBlockHist_SRV);
     sortReady = false;
+}
+
+void GaussianDrawData::releaseDepthPassResources()
+{
+    SAFE_RELEASE(depthClearCS);
+    SAFE_RELEASE(depthPassCS);
+    SAFE_RELEASE(depthCB);
+    SAFE_RELEASE(depthTex);
+    SAFE_RELEASE(depthTex_UAV);
+    SAFE_RELEASE(depthTex_SRV);
+    SAFE_RELEASE(depthCopyVS);
+    SAFE_RELEASE(depthCopyPS);
+    SAFE_RELEASE(depthWriteDS);
+    SAFE_RELEASE(depthCopyBlend);
+    depthTexW = depthTexH = 0;
+    depthPassReady = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +1022,134 @@ bool GaussianDrawData::createSortBuffers(ID3D11Device* device, uint32_t N)
 }
 
 // ---------------------------------------------------------------------------
+// initDepthPassPipeline  (compile 2 compute kernels + VS/PS + DS/blend state)
+// ---------------------------------------------------------------------------
+bool GaussianDrawData::initDepthPassPipeline(ID3D11Device* device)
+{
+    size_t csLen = strlen(kDepthPassCS);
+    HRESULT hr;
+
+    // -- Clear kernel --
+    {
+        D3D_SHADER_MACRO defs[] = { { "CLEAR_DEPTH_KERNEL", "1" }, { nullptr, nullptr } };
+        ID3DBlob* blob = nullptr;
+        if (!CompileStage(kDepthPassCS, csLen, "ClearDepthKernel", "cs_5_0", &blob, defs)) return false;
+        hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                          nullptr, &depthClearCS);
+        blob->Release();
+        if (FAILED(hr)) { MGlobal::displayError("[GaussianSplat] CreateComputeShader(ClearDepth) failed."); return false; }
+    }
+
+    // -- Depth pass kernel --
+    {
+        D3D_SHADER_MACRO defs[] = { { "DEPTH_PASS_KERNEL", "1" }, { nullptr, nullptr } };
+        ID3DBlob* blob = nullptr;
+        if (!CompileStage(kDepthPassCS, csLen, "DepthPassKernel", "cs_5_0", &blob, defs)) return false;
+        hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                          nullptr, &depthPassCS);
+        blob->Release();
+        if (FAILED(hr)) { MGlobal::displayError("[GaussianSplat] CreateComputeShader(DepthPass) failed."); return false; }
+    }
+
+    // -- Depth CB --
+    {
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth      = sizeof(CBDepth);
+        cbd.Usage          = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(device->CreateBuffer(&cbd, nullptr, &depthCB))) return false;
+    }
+
+    // -- Copy pass VS/PS --
+    {
+        size_t vsLen = strlen(kDepthCopyShader);
+        ID3DBlob* vsBlob = nullptr, *psBlob = nullptr;
+        if (!CompileStage(kDepthCopyShader, vsLen, "CopyVS", "vs_5_0", &vsBlob)) return false;
+        if (!CompileStage(kDepthCopyShader, vsLen, "CopyPS", "ps_5_0", &psBlob)) { vsBlob->Release(); return false; }
+
+        hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &depthCopyVS);
+        if (FAILED(hr)) { vsBlob->Release(); psBlob->Release(); return false; }
+        hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &depthCopyPS);
+        vsBlob->Release(); psBlob->Release();
+        if (FAILED(hr)) return false;
+    }
+
+    // -- Depth-write DS state (used by the copy pass only) --
+    {
+        D3D11_DEPTH_STENCIL_DESC dsd = {};
+        dsd.DepthEnable    = TRUE;
+        dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dsd.DepthFunc      = D3D11_COMPARISON_LESS;   // only overwrite when GS is nearer
+        dsd.StencilEnable  = FALSE;
+        if (FAILED(device->CreateDepthStencilState(&dsd, &depthWriteDS))) return false;
+    }
+
+    // -- Blend state for copy pass: mask out color writes (depth only) --
+    {
+        D3D11_BLEND_DESC bd = {};
+        bd.RenderTarget[0].BlendEnable           = FALSE;
+        bd.RenderTarget[0].RenderTargetWriteMask = 0; // no color writes
+        if (FAILED(device->CreateBlendState(&bd, &depthCopyBlend))) return false;
+    }
+
+    depthPassReady = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// createDepthTexture  (UAV + SRV, R32_UINT, viewport sized)
+// ---------------------------------------------------------------------------
+bool GaussianDrawData::createDepthTexture(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+    SAFE_RELEASE(depthTex);
+    SAFE_RELEASE(depthTex_UAV);
+    SAFE_RELEASE(depthTex_SRV);
+    depthTexW = depthTexH = 0;
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width          = w;
+    td.Height         = h;
+    td.MipLevels      = 1;
+    td.ArraySize      = 1;
+    td.Format         = DXGI_FORMAT_R32_UINT;
+    td.SampleDesc.Count = 1;
+    td.Usage          = D3D11_USAGE_DEFAULT;
+    td.BindFlags      = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+    HRESULT hr = device->CreateTexture2D(&td, nullptr, &depthTex);
+    if (FAILED(hr)) {
+        MGlobal::displayError(
+            MString("[GaussianSplat] CreateTexture2D(depthTex) failed: ") + (int)w + "x" + (int)h);
+        return false;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {};
+    uavd.Format        = DXGI_FORMAT_R32_UINT;
+    uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    uavd.Texture2D.MipSlice = 0;
+    if (FAILED(device->CreateUnorderedAccessView(depthTex, &uavd, &depthTex_UAV))) {
+        SAFE_RELEASE(depthTex);
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.Format        = DXGI_FORMAT_R32_UINT;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateShaderResourceView(depthTex, &srvd, &depthTex_SRV))) {
+        SAFE_RELEASE(depthTex);
+        SAFE_RELEASE(depthTex_UAV);
+        return false;
+    }
+
+    depthTexW = w;
+    depthTexH = h;
+    MGlobal::displayInfo(MString("[GaussianSplat] Depth UAV texture created: ") + (int)w + "x" + (int)h);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // createComputeOutputs
 // ---------------------------------------------------------------------------
 bool GaussianDrawData::createComputeOutputs(ID3D11Device* device, uint32_t N)
@@ -976,6 +1248,12 @@ MUserData* GaussianDrawOverride::prepareForDraw(
         else
             MGlobal::displayError("[GaussianSplat] Sort pipeline: FAILED");
     }
+    if (!data->depthPassReady && device) {
+        if (data->initDepthPassPipeline(device))
+            MGlobal::displayInfo("[GaussianSplat] Depth pass pipeline: OK");
+        else
+            MGlobal::displayError("[GaussianSplat] Depth pass pipeline: FAILED");
+    }
 
     // Find connected data node
     GaussianDataNode* dataNode = m_node->findConnectedDataNode();
@@ -1050,6 +1328,14 @@ MUserData* GaussianDrawOverride::prepareForDraw(
     frameContext.getViewportDimensions(ox, oy, vpW, vpH);
     data->vpWidth  = (float)vpW;
     data->vpHeight = (float)vpH;
+
+    // Recreate depth UAV texture if viewport size changed
+    if (device && data->depthPassReady &&
+        ((uint32_t)vpW != data->depthTexW || (uint32_t)vpH != data->depthTexH) &&
+        vpW > 0 && vpH > 0)
+    {
+        data->createDepthTexture(device, (uint32_t)vpW, (uint32_t)vpH);
+    }
 
     // tanHalfFov
     data->tanHalfFov[0] = (float)(1.0 / projMat[0][0]);
@@ -1352,6 +1638,88 @@ void GaussianDrawOverride::draw(const MHWRender::MDrawContext& context,
 
             ID3D11ShaderResourceView* nullSRVs6[6] = {};
             ctx->VSSetShaderResources(0, 6, nullSRVs6);
+        }
+
+        // -- 6. Depth pass: write per-pixel representative depth into a UAV
+        //         texture via compute (atomic min), then copy that into Maya's
+        //         real depth buffer so GS can occlude Maya transparent/virtual
+        //         geometry drawn later in the frame.
+        //         Runs AFTER the main alpha-blend render to avoid self-occlusion.
+        if (data->depthPassReady && data->depthTex_UAV && data->depthTex_SRV &&
+            data->depthTexW > 0 && data->depthTexH > 0)
+        {
+            uint32_t W = data->depthTexW;
+            uint32_t H = data->depthTexH;
+
+            // 6a. Update depth CB
+            {
+                D3D11_MAPPED_SUBRESOURCE mapped;
+                if (SUCCEEDED(ctx->Map(data->depthCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                    CBDepth* cb = static_cast<CBDepth*>(mapped.pData);
+                    cb->viewportW      = W;
+                    cb->viewportH      = H;
+                    cb->splatCount     = N;
+                    cb->radiusCap      = 16;     // per-splat AABB iteration cap
+                    cb->alphaThreshold = 0.5f;   // only dense splats contribute depth
+                    cb->pad0 = cb->pad1 = cb->pad2 = 0.f;
+                    ctx->Unmap(data->depthCB, 0);
+                }
+            }
+
+            // 6b. Clear depth UAV to asuint(1.0f)
+            {
+                ctx->CSSetShader(data->depthClearCS, nullptr, 0);
+                ctx->CSSetConstantBuffers(0, 1, &data->depthCB);
+                ctx->CSSetUnorderedAccessViews(0, 1, &data->depthTex_UAV, nullptr);
+                ctx->Dispatch((W + 15) / 16, (H + 15) / 16, 1);
+            }
+
+            // 6c. Depth pass: each thread (one per splat) atomic-mins its
+            //       NDC depth into the pixels its Gaussian covers.
+            {
+                ID3D11ShaderResourceView* srvs[] = {
+                    data->srvPositionSS, data->srvRadius,
+                    data->srvDepth,      data->srvCov2D
+                };
+                ctx->CSSetShader(data->depthPassCS, nullptr, 0);
+                ctx->CSSetConstantBuffers(0, 1, &data->depthCB);
+                ctx->CSSetShaderResources(0, 4, srvs);
+                // UAV (slot 0) still bound from clear pass
+                ctx->Dispatch((N + 255) / 256, 1, 1);
+
+                // Unbind CS resources
+                ID3D11ShaderResourceView*  nullSRV4[4] = {};
+                ID3D11UnorderedAccessView* nullUAV1[1] = {};
+                ctx->CSSetShaderResources(0, 4, nullSRV4);
+                ctx->CSSetUnorderedAccessViews(0, 1, nullUAV1, nullptr);
+                ctx->CSSetShader(nullptr, nullptr, 0);
+            }
+
+            // 6d. Copy pass: full-screen triangle writes asfloat(bits) to
+            //       SV_Depth. DepthFunc=LESS ensures Maya's already-written
+            //       opaque depth still wins where opaque geo is in front.
+            {
+                float copyBF[] = { 1.f, 1.f, 1.f, 1.f };
+                ctx->OMSetBlendState(data->depthCopyBlend, copyBF, 0xFFFFFFFF);
+                ctx->OMSetDepthStencilState(data->depthWriteDS, 0);
+
+                ctx->IASetInputLayout(nullptr);
+                ID3D11Buffer* nullVB[1] = {};
+                UINT nullStride[1] = { 0 };
+                UINT nullOffset[1] = { 0 };
+                ctx->IASetVertexBuffers(0, 1, nullVB, nullStride, nullOffset);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+                ctx->VSSetShader(data->depthCopyVS, nullptr, 0);
+                ctx->GSSetShader(nullptr, nullptr, 0);
+                ctx->PSSetShader(data->depthCopyPS, nullptr, 0);
+                ctx->PSSetShaderResources(0, 1, &data->depthTex_SRV);
+                ctx->Draw(3, 0);
+
+                // Unbind copy-pass resources
+                ID3D11ShaderResourceView* nullPSSRV[1] = {};
+                ctx->PSSetShaderResources(0, 1, nullPSSRV);
+            }
         }
     }
     // -----------------------------------------------------------------------

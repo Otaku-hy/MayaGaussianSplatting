@@ -132,12 +132,37 @@ public:
     bool sortReady = false;
 
     // -----------------------------------------------------------------------
+    // Depth Pass pipeline  (method B: compute writes per-pixel rep. depth
+    // into a UAV texture; copy pass transfers into Maya's depth buffer so
+    // GS objects can occlude Maya transparent/virtual geometry drawn later)
+    // -----------------------------------------------------------------------
+    ID3D11ComputeShader*       depthClearCS  = nullptr;
+    ID3D11ComputeShader*       depthPassCS   = nullptr;
+    ID3D11Buffer*              depthCB       = nullptr;
+
+    ID3D11Texture2D*           depthTex      = nullptr;
+    ID3D11UnorderedAccessView* depthTex_UAV  = nullptr;
+    ID3D11ShaderResourceView*  depthTex_SRV  = nullptr;
+    uint32_t                   depthTexW     = 0;
+    uint32_t                   depthTexH     = 0;
+
+    // Copy pass (full-screen triangle writing SV_Depth)
+    ID3D11VertexShader*        depthCopyVS   = nullptr;
+    ID3D11PixelShader*         depthCopyPS   = nullptr;
+    ID3D11DepthStencilState*   depthWriteDS  = nullptr;
+    ID3D11BlendState*          depthCopyBlend = nullptr;    // color writes masked out
+
+    bool depthPassReady = false;
+
+    // -----------------------------------------------------------------------
     // Init / upload helpers
     // -----------------------------------------------------------------------
     bool initDebugPipeline(ID3D11Device* device);
     bool initProductionPipeline(ID3D11Device* device);
     bool initSortPipeline(ID3D11Device* device);
+    bool initDepthPassPipeline(ID3D11Device* device);
     bool createSortBuffers(ID3D11Device* device, uint32_t N);
+    bool createDepthTexture(ID3D11Device* device, uint32_t w, uint32_t h);
 
     bool createComputeOutputs(ID3D11Device* device, uint32_t N);
 
@@ -147,6 +172,7 @@ private:
     void releaseDebugResources();
     void releaseProductionResources();
     void releaseSortResources();
+    void releaseDepthPassResources();
 
     bool createUAVBuffer(ID3D11Device* device,
                          const char*   name,
