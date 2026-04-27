@@ -4,7 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目简介
 
-这是一个 Maya 插件（C++/DX11），用于在 Autodesk Maya 2026 的 Viewport 2.0 中可视化 3D Gaussian Splatting 点云。当前 master 分支已实现完整的生产级渲染管线：**Compute 预处理 → GPU Radix 排序 → 实例化椭圆 Splat 渲染**，同时保留了简单圆点的 debug 路径。插件同时支持 Maya 几何体深度遮挡和完整 Maya 变换（移动/旋转/缩放）。
+Maya 插件（C++/DX11），在 Autodesk Maya 2026 的 Viewport 2.0 中可视化、交互编辑 3D Gaussian Splatting 点云。
+
+**当前版本：v0.3**
+
+已实现功能：
+- 完整生产级渲染管线：**Compute 预处理 → GPU Radix 排序 → 实例化椭圆 Splat 渲染**
+- Debug 路径（简单圆点）作为回退
+- Maya 几何体深度遮挡（GS ↔ Maya 几何体互相正确遮挡）
+- 完整 Maya 变换（移动/旋转/缩放）
+- **Marquee 框选系统**：VP2.0 context，框选 splat，soft-delete，Restore All，Save PLY
 
 ## 构建
 
@@ -12,161 +21,210 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **构建前必须设置的环境变量：**
 ```
-MAYA_LOCATION    — Maya 安装目录（头文件/库搜索路径），例：C:\Program Files\Autodesk\Maya2026
+MAYA_LOCATION    — Maya 安装目录，例：C:\Program Files\Autodesk\Maya2026
 DEVKIT_LOCATION  — Maya devkit 根目录
 ```
 
 **解决方案：** `GaussianSplatting/GaussianSplatting.sln`
 
-**本地构建脚本：** 仓库根目录 `_build_tmp.bat`（设置环境变量 + 调用 MSBuild Release|x64）。`build.bat` 是较早的版本。
+**本地构建脚本：** 仓库根目录 `_build_tmp.bat`（设置环境变量 + 调用 MSBuild Release|x64）。
 
-**Post-build：** 项目会把 `GaussianSplatting.mll` 复制到仓库根目录（`$(SolutionDir)..\`）。
+**Post-build：** 项目把 `GaussianSplatting.mll` 复制到仓库根目录（`$(SolutionDir)..\`）。
 
-**Maya 设置：** 必须把 Viewport 2.0 渲染引擎切换为 DirectX 11：
+**Maya 设置：** Viewport 2.0 必须切换为 DirectX 11：
 `Windows → Settings/Preferences → Preferences → Display → Viewport 2.0 → Rendering Engine: DirectX 11`
 
 ## 架构
 
-### 节点设计（v0.2 — 数据/渲染分离）
+### 节点设计（v0.3 — 自包含单节点）
 
 ```
-  gaussianSplatData (MPxNode)            gaussianSplat (MPxLocatorNode)
-  ─────────────────────────              ──────────────────────────────
-  filePath ── attributeAffects ──▶       inputData (message, 连入 DataNode)
-  dataReady (compute 时加载 PLY)          pointSize
-  outputData (message, 输出端)             renderMode (0=auto, 1=debug, 2=prod, 3=prod+fixedRadius)
-  持有 GaussianData + 5 个共享 SRV  ◀─────  引用 DataNode 的 SRV, 由 DrawOverride 渲染
+  gaussianSplat (MPxLocatorNode)
+  ──────────────────────────────────────────
+  filePath  → compute() 时触发 PLYReader
+  dataReady (hidden bool output)
+  pointSize (float, debug 圆点半径)
+  renderMode (int 0-3)
+
+  内部持有：
+    GaussianData (CPU 原始数据)
+    5 个输入 StructuredBuffer SRV
+    1 个选择 mask Buffer (SRV+UAV)
+    CPU mask shadow (std::vector<uint32_t>)
 ```
 
-一个 DataNode 可被多个 gaussianSplat 渲染节点连接，PLY 数据和 GPU 输入缓冲（PositionWS/Scale/Rotation/Opacity/SHCoeffs）仅上传一次。
+**v0.3 重要变化**：原来的 `gaussianSplatData`（MPxNode）已被**合并进 `gaussianSplat`**，不再存在。每个 `gaussianSplat` 节点完全自包含，互相独立，不可能意外共享数据。加载同一 PLY 两次 = 两个独立节点，各有独立 mask。
 
 ### 数据流
 
 ```
-PLY 文件 ──▶ PLYReader ──▶ GaussianData
+PLY 文件 ──▶ PLYReader ──▶ GaussianData (GaussianNode 内部)
                                 │
                                 ▼
-                      GaussianDataNode.compute (DG 触发)
+                      GaussianNode::compute() (DG 触发，filePath 变化时)
                                 │  uploadInputBuffersIfNeeded
                                 ▼
-         5 个 StructuredBuffer SRV (positionWS/scale/rotation/opacity/shCoeffs)
-                                │  非拥有引用, 每帧从 DataNode 拷贝
+         5 个 StructuredBuffer SRV + 1 个 selection mask buffer
+                                │
                                 ▼
               GaussianDrawOverride::prepareForDraw
-                                │
+                                │  触发 compute；上传 GPU buffer；
+                                │  注册到 GaussianRenderManager
                                 ▼
                   GaussianDrawOverride::draw (DX11)
                       ┌──────────┴──────────┐
             Production 路径              Debug 路径
-            (Compute+Sort+Ellipse)       (VS+GS+PS 圆点)
+          (Merged Preprocess+Sort+       (VS+GS+PS 圆点,
+           Ellipse instanced draw)        per-node SRV)
 ```
 
 ### 核心模块（`GaussianSplatting/src/`）
 
-| 文件 | 行数 | 说明 |
+| 文件 | 说明 |
+|---|---|
+| `plugin_main.cpp` | 注册 **1 个节点** + DrawOverride + 5 个命令 + context 命令；内嵌 MEL 构建菜单和 AE 模板 |
+| `GaussianNode.{h,cpp}` | **自包含** MPxLocatorNode。持有 GaussianData、5 个输入 SRV、selection mask buffer。`compute()` 在 filePath 变化时加载 PLY；所有 GPU buffer 管理、mask 操作都在这里 |
+| `GaussianDataNode.{h,cpp}` | **已废弃**，保留为空 stub，不注册任何节点 |
+| `GaussianDrawOverride.{h,cpp}` | 渲染路径。`prepareForDraw` 直接从 `m_node`（GaussianNode）取 SRV；注册到 RenderManager |
+| `GaussianRenderManager.{h,cpp}` | 单例，合并多个实例的 buffer 并执行一次 preprocess+sort+render。`RenderInstance.node` 是 `GaussianNode*` |
+| `GaussianSelection.{h,cpp}` | 5 个 Maya 命令（`gsMarqueeSelect`/`gsClearSelection`/`gsDeleteSelected`/`gsRestoreAll`/`gsSavePLY`）+ `GSMarqueeContext`（VP2.0 框选工具） |
+| `PLYReader.{h,cpp}` | binary_little_endian + ASCII；exp(log_scale)；四元数归一化；SH planar→interleaved |
+| `GaussianData.h` | POD：`GaussianSplat` 原始数据 + `GaussianData` 展平数组 + bbox；`kMaskBitSelected=1, kMaskBitDeleted=2` |
+
+### 关键点：所有 HLSL 内嵌在 GaussianRenderManager.cpp / GaussianDrawOverride.cpp
+
+| 变量 | 位置 | 内容 |
 |---|---|---|
-| `plugin_main.cpp` | 189 | 注册 2 个节点 + DrawOverride，执行内嵌 MEL 构建 **"Gaussian Splatting" 顶部菜单**（Load PLY / Create Data Node / Create Render Node / Connect Selected） |
-| `GaussianDataNode.{h,cpp}` | 86+194 | `MPxNode`，拥有 `GaussianData` 与 5 个共享 SRV。`compute` 在 `filePath` 变化时调用 PLYReader，打印 scale 诊断（检测缺失 scale_0/1/2 导致的 1m 半径问题） |
-| `GaussianNode.{h,cpp}` | 46+78 | `MPxLocatorNode`，纯渲染代理；通过 `inputData` message attr 连接上游 DataNode；`boundingBox()` 从 DataNode 拿 AABB（支持选择框和视锥剔除） |
-| `GaussianDrawOverride.{h,cpp}` | 194+1398 | **当前活跃渲染路径**。`GaussianDrawData`（MUserData）拥有 per-render-node 的 DX11 资源；`GaussianDrawOverride::draw` 根据 `renderMode` 选择管线。所有 HLSL 作为 `static const char*` 内嵌（见下文）。`isTransparent()` 返回 true 以保证 Maya 几何体先写深度 |
-| `GaussianGeometryOverride.{h,cpp}` | 52+201 | 旧版 `MPxGeometryOverride`，**已保留但未使用**，由 DrawOverride 取代 |
-| `PLYReader.{h,cpp}` | 12+357 | 支持 binary_little_endian 和 ASCII；在 `buildGPUArrays()` 里做：`exp(log_scale)`、四元数归一化、SH 系数从 PLY 的 planar 布局（f_rest[0..44]，所有 r 后所有 g 后所有 b）重新交织为 16 组 float3；同时计算 object-space AABB |
-| `GaussianData.h` | 49 | POD：`GaussianSplat` 原始数据 + `GaussianData` 展平数组（positions/colors/scaleWS/rotationWS/opacityRaw/shCoeffs）+ bbox |
+| `kMergedPreprocessCS` | GaussianRenderManager.cpp | 合并多实例的预处理 CS（读 instanceID + worldMats）|
+| `kProdShaderSrc` | GaussianRenderManager.cpp | Production VS+PS（实例化椭圆）|
+| `kRadixSortCS` | GaussianRenderManager.cpp | 4 个 radix sort kernel |
+| `kDbgShaderSrc` | GaussianDrawOverride.cpp | Debug VS+GS+PS（圆点）|
 
-### 关键点：Shader 都在 C++ 字符串里
-
-**实际运行的所有 HLSL 代码都以 `static const char*` 内嵌在 `GaussianDrawOverride.cpp` 顶部**，通过 `D3DCompile` 运行时编译：
-
-| 变量 | 内容 | 源码位置 |
-|---|---|---|
-| `kDbgShaderSrc` | Debug 路径：VS+GS+PS，圆形 Splat（点→四边形→圆遮罩） | 第 27 行附近 |
-| `kProdShaderSrc` | Production 渲染：VS 实例化（4 顶点/splat 从 `gSortedIndices` 读索引）+ PS（Gaussian 椭圆 alpha） | 第 91 行附近 |
-| `kPreprocessCS` | 预处理 compute shader，`PreprocessKernel` 256 线程/组 | 第 164 行附近 |
-| `kRadixSortCS` | 4 个 radix sort kernel，通过 `#define` 切换：`KEYGEN_KERNEL` / `COUNT_KERNEL` / `SCAN_KERNEL` / `SCATTER_KERNEL` | 第 340 行附近 |
-
-**`GaussianSplatting/shaders/` 目录下的 `Preprocessing.compute` 和 `gaussianDebug.fx` 是遗留参考文件，`.vcxproj` 中已标记 `ExcludedFromBuild`，不参与构建**。修改任何 shader 都必须编辑 `GaussianDrawOverride.cpp` 里的字符串常量。
+**`shaders/` 目录下的文件是遗留参考，不参与构建。** 修改 shader 必须编辑上述 C++ 字符串常量。
 
 ## 渲染管线细节
 
-### Production 路径（`renderMode=0` auto 或 `=2` 强制）
+### Production 路径（renderMode=0 auto 或 =2）
 
-每帧在 `GaussianDrawOverride::draw` 里执行以下顺序（约第 1180 行起）：
+每帧 `GaussianRenderManager::render()` 执行：
 
-1. **更新 Preprocess CB**：world/view/proj 矩阵、cameraPos、tanHalfFov、filmW/H、splat 数、`debugFixedRadius`（`renderMode=3` 时设为 5，用于诊断）
-2. **Dispatch `PreprocessKernel`**（256 线程/组，共 `⌈N/256⌉` 组）
-   - 读 5 个输入 SRV（positionWS/scale/rotation/opacity/shCoeffs）
-   - 写 5 个输出 UAV（positionSS/depth/radius/color/cov2D_opacity）
-   - 做 view 空间剔除（`posVS.z >= -0.2` 丢弃）、object→world→view→clip 变换、3D→2D 协方差投影、radius 计算（`ceil(3√λmax)`，上限 1024）、4 阶 SH 求值
-3. **GPU Radix Sort**：
-   - **3a. KeyGen**（256 线程/组）：`gKeysA[i] = ~FloatToSortKey(depth[i])` → 降序 = back-to-front；`gValsA[i] = i`
-   - **3b. 4 趟 8-bit radix**（pass=0..3，`shift = pass*8`），每趟：
-     - **Count**：每 block 一个 256-bucket 直方图 → `gBlockHist[numBlocks×256]`
-     - **Scan**（单组，256 线程）：每 digit 跨 block 做 exclusive prefix sum，再对 digit-total 做 exclusive scan，写回到 `gBlockHist` 作为全局起始偏移
-     - **Scatter**：每个 block 用 `groupshared sLocalRank` + `InterlockedAdd` 局部计数，写到 `gBlockOff + rank` 的输出位置
-     - Ping-pong：even pass A→B，odd pass B→A；4 趟（偶数）后结果在 A
-   - Tile size：`SORT_GROUP_SIZE(256) × ITEMS_PER_THREAD(16) = 4096` 元素/block
-4. **更新 Render CB**（只含 viewport 尺寸）
-5. **DrawInstanced(4, N, 0, 0)**：
-   - 拓扑 `TRIANGLESTRIP`，无 GS，无 InputLayout，无 VB
-   - VS 用 `SV_VertexID`（0..3）作为 quad 角标，`SV_InstanceID` 作为绘制顺序
-   - VS 做 `idx = gSortedIndices[iid]` 查排序后的 splat 索引，然后从 compute 输出 SRV 读取 posSS/radius/color/cov2D/depth
-   - PS 用 inverse 2D covariance 做 EWA Gaussian alpha：`alpha = opacity * exp(-0.5 * (a·x² + 2b·xy + c·y²))`，`< 1/255` 丢弃
+1. **buildMergedInputs**：将所有 RenderInstance 的 CPU 数据拼接上传为合并 buffer（位置/scale/rotation/opacity/SH/instanceID/worldMats）。有 signature 缓存，只在实例集变化时重建。
+2. **updateMergedSelection**：按 maskVersion 检测变化，重建合并 selection mask buffer。
+3. **Dispatch PreprocessKernel**（256线程/组）：per-splat 通过 instanceID 查 worldMat，做 object→world→view→clip，计算 2D 协方差，EWA radius，SH 颜色。删除位(bit1)=1 的 splat 输出 radius=0 跳过。
+4. **GPU Radix Sort**（4 趟 8-bit，key=~depth 降序=back-to-front）
+5. **DrawInstanced(4, N)**：TRIANGLESTRIP，VS 通过 SV_InstanceID 查排序索引，读 compute 输出 SRV。PS 做 Gaussian 椭圆 alpha。
 
-**CS 5.0 + 无 wave intrinsics**：所有 compute shader 都用 `cs_5_0` target 编译，避免 SM 6.x 依赖。排序靠 `groupshared` + `InterlockedAdd` 实现，不使用 `WaveActiveSum` 等 wave 函数。
+### Debug 路径（renderMode=1 或 production 失败时自动回退）
 
-### Debug 路径（`renderMode=1` 或 production fallback）
-
-直接从共享输入 SRV 读 position/opacity/SH[0]：
-- VS：SH degree-0 颜色（`sh[0] * 0.282095 + 0.5`）+ sigmoid opacity
-- GS：每个点扩展为屏幕对齐 quad（`pointSize` 像素）
-- PS：`clip(1 - r²)` 圆形 + 软边淡出
-
-**用途**：快速可视化、检查 PLY 加载是否正确、点大小可在 AE 的 `pointSize` 滑杆上调。
+per-node，直接读节点自己的 SRV（positionWS/opacity/SHCoeffs），VS+GS+PS，圆形 splat。
 
 ### Maya 集成要点
 
-- **`isTransparent() = true`**（`GaussianDrawOverride.h:177`）：让 splat 在透明 pass 绘制，Maya 不透明几何体的深度已经在 depth buffer 里 → 自动正确遮挡
-- **变换支持**：每帧 `objPath.inclusiveMatrix()` 取 `worldMat`，传给 compute shader；shader 内做 `posWS = posOS * worldMat`（Maya row-major 约定）；协方差按 `cov_WS = W^T * cov_obj * W` 变换（`GaussianDrawOverride.cpp:293-296`）
-- **包围盒**：`GaussianData::buildGPUArrays()` 里计算 object-space AABB，`GaussianDataNode::boundingBox()` 暴露给 Maya，支持选择框、视锥剔除、变换手柄自动适配
-- **输入缓冲懒加载**：DataNode 的 DX11 buffer 在首次 `prepareForDraw` 时通过 `uploadInputBuffersIfNeeded` 上传，PLY 切换时自动释放重建
-- **DX11 状态保存/恢复**：`draw()` 开头保存 Maya 的 blend/RS/DS/InputLayout/VS/GS/PS，结尾全部恢复，避免污染 Maya 渲染状态
-- **SH 步长常量**：C++ 用 `kSHCoeffsPerSplat = 16`（`GaussianData.h:6`），作为 debug shader CB 的 `gSHStride` 传入
+- **`isTransparent() = true`**：splat 在透明 pass 绘制，Maya 不透明几何体深度已在 depth buffer → 自动互相遮挡
+- **变换**：`objPath.inclusiveMatrix()` → worldMat → 传给 compute shader；协方差按 `W^T * cov_obj * W` 变换
+- **包围盒**：`GaussianNode::boundingBox()` 返回 PLY 加载时计算的 object-space AABB
+- **DX11 状态保存/恢复**：`draw()` 开头保存 Maya 的 blend/RS/DS/InputLayout/VS/GS/PS，结尾全部恢复
+- **实例 dedup**：`GaussianRenderManager::registerInstance` 按 `node` 指针去重，防止 prepareForDraw 多次调用导致计数膨胀
+
+## 选择与编辑系统
+
+### Marquee Context（GSMarqueeContext）
+
+**关键架构**：Maya VP2.0（DX11 模式）**只调用 3 参数版本**的 `doPress/doDrag/doRelease`（带 `MUIDrawManager`）。1 参数 legacy 版本在 VP2.0 下不会被调用。`drawFeedback()` 每帧绘制黄色矩形。
+
+```
+doPress (3-arg)   → 存储 m_x0, m_y0；m_dragging=true
+doDrag  (3-arg)   → 更新 m_x1, m_y1（绘制在 drawFeedback 里）
+doRelease (3-arg) → 调用 runSelectionFromRect()
+drawFeedback      → 如果 m_dragging，用 MUIDrawManager 画黄框
+
+drawFeedback 用 MUIDrawManager::rect2d(center, MVector(0,1,0), hw, hh, false)
+```
+
+**激活 context 必须 delete 再 recreate**（防止 plugin reload 后旧 context 残留）：
+```mel
+if (`contextInfo -exists gsMarqueeCtx1`) deleteUI gsMarqueeCtx1;
+gsMarqueeCtx gsMarqueeCtx1;
+setToolTo gsMarqueeCtx1;
+```
+
+### 选择范围（collectRenderPairs）
+
+1. 检查 Maya 当前选中的节点中是否有 `gaussianSplat` 类型（直接选 shape 或选 transform 下的 shape）
+2. 有 → 只对选中的节点做框选
+3. 无 → fall back 到场景中所有 `gaussianSplat` 节点
+
+### CPU 选择逻辑（runSelection）
+
+无 GPU CS，无 readback stall。纯 CPU：
+1. 计算 `wvp = worldMat * viewProj`（row-major 矩阵乘法）
+2. 每个 splat 做 `posNDC = pos * wvp / w`
+3. 测试是否落在框选 NDC rect 内
+4. 按 mode（replace/add/subtract/toggle）更新 `m_maskShadow`
+5. `UpdateSubresource` 把 CPU shadow 写回 GPU buffer
+6. `markMaskChanged()` 使 RenderManager 下一帧重建合并 selection
+
+### Mask Buffer 格式
+
+每 splat 一个 `uint32_t`：
+- `bit 0 (kMaskBitSelected=1)` = 选中（黄色高亮）
+- `bit 1 (kMaskBitDeleted=2)` = 软删除（不渲染）
+
+preprocess CS 里：`if (mask & 2u) { gRadius[id.x] = 0.0f; return; }`
+
+### 命令列表
+
+| 命令 | 说明 |
+|---|---|
+| `gsMarqueeSelect -min x0 y0 -max x1 y1 -mo mode` | MEL 脚本框选（NDC 坐标） |
+| `gsClearSelection` | 清除所有节点的选中位 |
+| `gsDeleteSelected` | 软删除选中 splat（所有节点） |
+| `gsRestoreAll [-node name]` | 清除 mask（可指定单个节点） |
+| `gsSavePLY -file path [-node name]` | 导出非删除 splat 为 binary PLY |
 
 ## 常量与 Magic Number 速查
 
 | 名称 | 值 | 说明 |
 |---|---|---|
-| `kSHCoeffsPerSplat` | 16 | 每 splat 16 组 float3 SH（0–3 阶） |
+| `kSHCoeffsPerSplat` | 16 | 每 splat 16 组 float3 SH（0–3 阶）|
+| `kMaskBitSelected` | 1 | mask bit 0 |
+| `kMaskBitDeleted` | 2 | mask bit 1 |
 | `kSortGroupSize` | 256 | Radix sort 线程组大小 |
-| `kSortItemsPerThread` | 16 | 每线程处理的元素数 |
-| `kSortTileSize` | 4096 | = 256 × 16，每 block 处理的元素数 |
+| `kSortItemsPerThread` | 16 | 每线程元素数 |
+| `kSortTileSize` | 4096 | = 256×16，每 block 元素数 |
 | `kRadixSize` | 256 | 8-bit radix 桶数 |
-| `PreprocessKernel` 组大小 | 256 | `⌈N/256⌉` dispatch |
-| Radius 上限 | 1024 px | 超过直接剔除，避免 GPU 杀手级全屏 quad |
-| Z 剔除阈值 | `posVS.z >= -0.2` | 近平面之后即剔除（Maya 右手系，负 z 朝前） |
+| PreprocessKernel 组大小 | 256 | `⌈N/256⌉` dispatch |
+| Radius 上限 | 1024 px | 超过直接剔除 |
+| Z 剔除阈值 | `posVS.z >= -0.2` | 近平面之后剔除 |
 
 ## 常见陷阱
 
-- **"splats 都是 1m 半径"**：PLY 缺少 `scale_0/1/2` 属性（COLMAP sparse 点云），DataNode 会在 Script Editor 打印 `<<< ALL 1.0 — PLY likely missing scale... >>>` 警告。要加载 **训练输出**，比如 `output/<scene>/point_cloud/iteration_30000/point_cloud.ply`，不是 COLMAP 的 sparse/points3D
-- **`shaders/Preprocessing.compute` 与运行版不一致**：磁盘那份是老版本，有 `#pragma kernel` vs 入口名不一致、SH 末尾 `max(..., 1.0)` 写错为 0.0、`Get2DCovariance` 参数错误等问题。**运行时用的是 `kPreprocessCS` 字符串常量**，已修复。请勿拿磁盘的 `.compute` 当作权威源
-- **Rotation 四元数存储顺序**：PLY 里是 `rot_0..rot_3` = `w,x,y,z`；在 HLSL 里 `float4` 读进来后是 `rotation.x=w, .y=x, .z=y, .w=z`（见 `kPreprocessCS` 里 `Get3DCovariance`），和直觉反的，改 shader 时需要注意
-- **`renderMode=3`** 是诊断模式：强制使用 production 路径但覆盖 radius 为固定 5 像素，用来区分"排序错"还是"协方差错"
-- **Sort 准备未就绪时自动回退**：`draw()` 里 `canProd = prodReady && sortReady && inputsReady && allocatedN==vertexCount && sortValsA_SRV`，任一失败就走 debug 路径
-- **PLY 切换 → 重新分配**：`allocatedN != N` 时调用 `createComputeOutputs(device, N)`，会同时重建 sort buffer（keys A/B、vals A/B、blockHist）
-- **编码警告 C4819**：中文注释触发 warning，可忽略
+- **"splats 都是 1m 半径"**：PLY 缺少 `scale_0/1/2`（COLMAP sparse 点云）。用 3DGS 训练输出的 `point_cloud.ply`，不是 COLMAP 的 `points3D`
+- **Rotation 四元数顺序**：PLY `rot_0..3 = w,x,y,z`；HLSL float4 读进来 `.x=w .y=x .z=y .w=z`
+- **`renderMode=3`**：诊断模式，强制 production 路径但 radius 固定 5px，用于区分排序错 vs 协方差错
+- **VP2.0 context 1-arg 不被调用**：`doPress(MEvent&)` 等在 VP2.0/DX11 下不触发，必须重写 3-arg 版本
+- **Context reload 残留**：`unloadPlugin` 不销毁已创建的 context 对象，必须在激活前 `deleteUI gsMarqueeCtx1` 再重建
+- **AE callCustom 参数格式**：`editorTemplate -callCustom "proc1" "proc2" ""` 传空串；proc 收到 `nodeName.`，用 `stringToStringArray($arg, ".")[0]` 提取节点名
+- **编码警告 C4819**：中文注释触发，可忽略
 
 ## 菜单用法
 
 加载插件后顶部栏出现 **"Gaussian Splatting"** 菜单：
 
-1. **Load PLY File...**：一键完成 `createNode gaussianSplatData` → 设置 filePath → 创建 transform + gaussianSplat shape → `connectAttr outputData → inputData`
-2. **Create Data Node** / **Create Render Node**：分别创建空节点，方便手动连接多个 render node 到同一 data
-3. **Connect Selected**：选中 data node 再选 render node（或其 transform），点击即完成连接
+1. **Load PLY File...**：创建独立的 `gaussianSplat` 节点并加载 PLY（每次加载都是独立副本）
+2. **Create Gaussian Splat Node**：创建空节点，在 AE 里设置 filePath
+3. **Marquee Select Tool**：激活框选工具；如果已选中某个 gaussianSplat 节点，只对该节点生效
+4. **Clear Selection / Delete Selected / Restore All**：选择编辑操作
+5. **Save PLY As...**：导出当前选中节点（或第一个节点）的非删除 splat
 
-也可以纯 MEL：
+**Attribute Editor**（选中 gaussianSplat 节点）：
+- `filePath`：直接在 AE 里修改即可切换 PLY
+- `pointSize` / `renderMode`：debug 参数
+- **Restore All** / **Delete Selected** / **Save PLY As...**：针对当前节点的编辑按钮
+
+纯 MEL 用法：
 ```mel
-string $d = `createNode gaussianSplatData`;
-setAttr -type "string" ($d + ".filePath") "C:/path/to/point_cloud.ply";
-string $r = `createNode gaussianSplat`;
-connectAttr ($d + ".outputData") ($r + ".inputData");
+string $t = `createNode transform -name "gaussianSplat1"`;
+string $n = `createNode gaussianSplat -parent $t`;
+setAttr -type "string" ($n + ".filePath") "C:/path/to/point_cloud.ply";
 ```

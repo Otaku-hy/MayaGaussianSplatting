@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-class GaussianDataNode;
+class GaussianNode;
 
 // ===========================================================================
 // GaussianRenderManager  --  Singleton that merges all GaussianSplat instances
@@ -17,9 +17,9 @@ class GaussianDataNode;
 // ===========================================================================
 
 struct RenderInstance {
-    GaussianDataNode* dataNode;        // source data
-    float             worldMat[16];    // per-instance world transform
-    uint32_t          splatCount;      // dataNode->splatCount()
+    GaussianNode* node;            // source data (self-contained gaussianSplat)
+    float         worldMat[16];    // per-instance world transform
+    uint32_t      splatCount;      // node->splatCount()
 };
 
 class GaussianRenderManager {
@@ -52,7 +52,7 @@ public:
     // Returns true on success. Automatically marks the Manager's merged
     // selection as dirty so the next draw picks up the change.
     bool runSelection(ID3D11Device* device, ID3D11DeviceContext* ctx,
-                      GaussianDataNode* node,
+                      GaussianNode* node,
                       const float worldMat[16],
                       const float viewProj[16],
                       float rectMinX, float rectMinY,

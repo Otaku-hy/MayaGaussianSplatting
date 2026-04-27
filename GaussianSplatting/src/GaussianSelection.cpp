@@ -1,6 +1,6 @@
 #define NOMINMAX
 #include "GaussianSelection.h"
-#include "GaussianDataNode.h"
+#include "GaussianNode.h"
 #include "GaussianRenderManager.h"
 #include "GaussianData.h"
 
@@ -41,66 +41,86 @@ ID3D11DeviceContext* getDX11Context(ID3D11Device* device) {
     return ctx;
 }
 
-// Enumerate all loaded gaussianSplatData nodes in the scene.
-void collectDataNodes(std::vector<GaussianDataNode*>& out) {
-    MItDependencyNodes it(MFn::kPluginDependNode);
-    for (; !it.isDone(); it.next()) {
-        MObject obj = it.thisNode();
-        MFnDependencyNode fn(obj);
-        if (fn.typeId() == GaussianDataNode::typeId) {
-            GaussianDataNode* node = static_cast<GaussianDataNode*>(fn.userNode());
-            if (node) out.push_back(node);
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Scene enumeration helpers
+// ---------------------------------------------------------------------------
 
-GaussianDataNode* findDataNodeByName(const MString& name) {
-    MSelectionList sel;
-    if (sel.add(name) != MS::kSuccess) return nullptr;
-    MObject obj;
-    sel.getDependNode(0, obj);
-    MFnDependencyNode fn(obj);
-    if (fn.typeId() != GaussianDataNode::typeId) return nullptr;
-    return static_cast<GaussianDataNode*>(fn.userNode());
-}
-
-// Enumerate (renderNode, dataNode) pairs: for each gaussianSplat locator in
-// the scene, fetch its inputData->source as GaussianDataNode*.
 struct RenderPair {
-    MDagPath          dagPath;
-    GaussianDataNode* dataNode = nullptr;
+    MDagPath      dagPath;
+    GaussianNode* node = nullptr;
 };
 
-void collectRenderPairs(std::vector<RenderPair>& out) {
-    // gaussianSplat is MPxLocatorNode → kPluginLocatorNode, NOT kPluginDependNode
+// Collect all gaussianSplat locator nodes in the scene.
+void collectAllNodes(std::vector<RenderPair>& out) {
     MItDependencyNodes it(MFn::kPluginLocatorNode);
     for (; !it.isDone(); it.next()) {
         MObject obj = it.thisNode();
         MFnDependencyNode fn(obj);
         if (fn.typeName() != "gaussianSplat") continue;
-
         MFnDagNode dag(obj);
         if (dag.isDefaultNode()) continue;
-
         MDagPath path;
         if (dag.getPath(path) != MS::kSuccess) continue;
-
-        // Follow inputData -> outputData link
-        MPlug inPlug = fn.findPlug("inputData", false);
-        if (inPlug.isNull()) continue;
-        MPlugArray sources;
-        inPlug.connectedTo(sources, true, false);
-        if (sources.length() == 0) continue;
-
-        MObject srcNode = sources[0].node();
-        MFnDependencyNode srcFn(srcNode);
-        if (srcFn.typeId() != GaussianDataNode::typeId) continue;
-
-        RenderPair p;
-        p.dagPath  = path;
-        p.dataNode = static_cast<GaussianDataNode*>(srcFn.userNode());
-        if (p.dataNode) out.push_back(p);
+        GaussianNode* n = static_cast<GaussianNode*>(fn.userNode());
+        if (n) { RenderPair p; p.dagPath = path; p.node = n; out.push_back(p); }
     }
+}
+
+// Collect gaussianSplat nodes:
+//   - If any gaussianSplat (or its transform) is currently selected in Maya,
+//     return only those (scoped operation).
+//   - Otherwise fall back to all nodes in the scene.
+void collectRenderPairs(std::vector<RenderPair>& out) {
+    MSelectionList sel;
+    MGlobal::getActiveSelectionList(sel);
+
+    for (unsigned int i = 0; i < sel.length(); i++) {
+        MDagPath path;
+        if (sel.getDagPath(i, path) != MS::kSuccess) continue;
+
+        // If transform, look for gaussianSplat shapes underneath
+        if (path.node().hasFn(MFn::kTransform)) {
+            unsigned int nShapes = 0;
+            path.numberOfShapesDirectlyBelow(nShapes);
+            for (unsigned int j = 0; j < nShapes; j++) {
+                MDagPath shapePath = path;
+                if (shapePath.extendToShapeDirectlyBelow(j) != MS::kSuccess) continue;
+                MFnDependencyNode fn(shapePath.node());
+                if (fn.typeName() != "gaussianSplat") continue;
+                GaussianNode* n = static_cast<GaussianNode*>(fn.userNode());
+                if (n) { RenderPair p; p.dagPath = shapePath; p.node = n; out.push_back(p); }
+            }
+        } else {
+            MFnDependencyNode fn(path.node());
+            if (fn.typeName() != "gaussianSplat") continue;
+            GaussianNode* n = static_cast<GaussianNode*>(fn.userNode());
+            if (n) { RenderPair p; p.dagPath = path; p.node = n; out.push_back(p); }
+        }
+    }
+
+    if (out.empty()) collectAllNodes(out);  // fall back to all
+}
+
+// Collect all gaussianSplat nodes (for non-scoped commands like gsClearSelection).
+void collectAllGaussianNodes(std::vector<GaussianNode*>& out) {
+    MItDependencyNodes it(MFn::kPluginLocatorNode);
+    for (; !it.isDone(); it.next()) {
+        MObject obj = it.thisNode();
+        MFnDependencyNode fn(obj);
+        if (fn.typeName() != "gaussianSplat") continue;
+        GaussianNode* n = static_cast<GaussianNode*>(fn.userNode());
+        if (n) out.push_back(n);
+    }
+}
+
+GaussianNode* findNodeByName(const MString& name) {
+    MSelectionList sel;
+    if (sel.add(name) != MS::kSuccess) return nullptr;
+    MObject obj;
+    sel.getDependNode(0, obj);
+    MFnDependencyNode fn(obj);
+    if (fn.typeName() != "gaussianSplat") return nullptr;
+    return static_cast<GaussianNode*>(fn.userNode());
 }
 
 // Multiply two row-major 4x4 matrices: out = a * b
@@ -168,10 +188,10 @@ MStatus GSMarqueeSelectCmd::doIt(const MArgList& args) {
 
     int nSuccess = 0;
     for (const auto& p : pairs) {
-        if (!p.dataNode || !p.dataNode->areInputsReady()) continue;
+        if (!p.node || !p.node->areInputsReady()) continue;
         float worldMat[16];
         mmatrixToFloat16(p.dagPath.inclusiveMatrix(), worldMat);
-        if (mgr.runSelection(device, ctx, p.dataNode,
+        if (mgr.runSelection(device, ctx, p.node,
                              worldMat, viewProj,
                              (float)x0, (float)y0, (float)x1, (float)y1,
                              mode))
@@ -198,11 +218,10 @@ MStatus GSClearSelectionCmd::doIt(const MArgList&) {
     ID3D11DeviceContext* ctx = getDX11Context(device);
     if (!ctx) return MS::kFailure;
 
-    std::vector<GaussianDataNode*> nodes;
-    collectDataNodes(nodes);
-    for (GaussianDataNode* n : nodes) {
+    std::vector<GaussianNode*> nodes;
+    collectAllGaussianNodes(nodes);
+    for (GaussianNode* n : nodes)
         if (n->areInputsReady()) n->clearSelection(ctx);
-    }
 
     GaussianRenderManager::instance().markSelectionDirty();
     ctx->Release();
@@ -221,11 +240,10 @@ MStatus GSDeleteSelectedCmd::doIt(const MArgList&) {
     ID3D11DeviceContext* ctx = getDX11Context(device);
     if (!ctx) return MS::kFailure;
 
-    std::vector<GaussianDataNode*> nodes;
-    collectDataNodes(nodes);
-    for (GaussianDataNode* n : nodes) {
+    std::vector<GaussianNode*> nodes;
+    collectAllGaussianNodes(nodes);
+    for (GaussianNode* n : nodes)
         if (n->areInputsReady()) n->deleteSelected(ctx);
-    }
 
     GaussianRenderManager::instance().markSelectionDirty();
     ctx->Release();
@@ -256,17 +274,17 @@ MStatus GSRestoreAllCmd::doIt(const MArgList& args) {
 
     if (db.isFlagSet("-n")) {
         MString name; db.getFlagArgument("-n", 0, name);
-        GaussianDataNode* n = findDataNodeByName(name);
+        GaussianNode* n = findNodeByName(name);
         if (!n) {
-            displayError(MString("gsRestoreAll: no gaussianSplatData named ") + name);
+            displayError(MString("gsRestoreAll: no gaussianSplat named ") + name);
             ctx->Release();
             return MS::kFailure;
         }
         if (n->areInputsReady()) n->restoreAll(ctx);
     } else {
-        std::vector<GaussianDataNode*> nodes;
-        collectDataNodes(nodes);
-        for (GaussianDataNode* n : nodes)
+        std::vector<GaussianNode*> nodes;
+        collectAllGaussianNodes(nodes);
+        for (GaussianNode* n : nodes)
             if (n->areInputsReady()) n->restoreAll(ctx);
     }
 
@@ -341,20 +359,20 @@ MStatus GSSavePLYCmd::doIt(const MArgList& args) {
     }
     MString path; db.getFlagArgument("-f", 0, path);
 
-    GaussianDataNode* node = nullptr;
+    GaussianNode* node = nullptr;
     if (db.isFlagSet("-n")) {
         MString name; db.getFlagArgument("-n", 0, name);
-        node = findDataNodeByName(name);
+        node = findNodeByName(name);
         if (!node) {
-            displayError(MString("gsSavePLY: no gaussianSplatData named ") + name);
+            displayError(MString("gsSavePLY: no gaussianSplat named ") + name);
             return MS::kFailure;
         }
     } else {
-        std::vector<GaussianDataNode*> nodes;
-        collectDataNodes(nodes);
-        for (GaussianDataNode* n : nodes) if (n->hasData()) { node = n; break; }
+        std::vector<GaussianNode*> nodes;
+        collectAllGaussianNodes(nodes);
+        for (GaussianNode* n : nodes) if (n->hasData()) { node = n; break; }
         if (!node) {
-            displayError("gsSavePLY: no gaussianSplatData with loaded data found.");
+            displayError("gsSavePLY: no gaussianSplat with loaded data found.");
             return MS::kFailure;
         }
     }
@@ -512,16 +530,16 @@ void GSMarqueeContext::runSelectionFromRect(MEvent& event) {
 
     int nSuccess = 0;
     for (const auto& p : pairs) {
-        if (!p.dataNode) { MGlobal::displayInfo("[GS CTX]   pair: null dataNode, skip"); continue; }
-        if (!p.dataNode->areInputsReady()) {
+        if (!p.node) { MGlobal::displayInfo("[GS CTX]   pair: null node, skip"); continue; }
+        if (!p.node->areInputsReady()) {
             MGlobal::displayInfo("[GS CTX]   pair: inputs not ready, skip");
             continue;
         }
         MGlobal::displayInfo(MString("[GS CTX]   running selection on node with ") +
-                             (int)p.dataNode->splatCount() + " splats");
+                             (int)p.node->splatCount() + " splats");
         float worldMat[16];
         mmatrixToFloat16(p.dagPath.inclusiveMatrix(), worldMat);
-        if (mgr.runSelection(device, ctx, p.dataNode, worldMat, viewProj,
+        if (mgr.runSelection(device, ctx, p.node, worldMat, viewProj,
                              nxMin, nyMin, nxMax, nyMax, mode))
             nSuccess++;
     }

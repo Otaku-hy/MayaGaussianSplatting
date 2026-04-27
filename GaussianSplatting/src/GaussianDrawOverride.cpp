@@ -1,6 +1,6 @@
 #include "GaussianDrawOverride.h"
 #include "GaussianNode.h"
-#include "GaussianDataNode.h"
+// GaussianDataNode.h removed — data now lives in GaussianNode directly
 #include "GaussianRenderManager.h"
 
 #include <maya/MDagPath.h>
@@ -235,17 +235,13 @@ MHWRender::DrawAPI GaussianDrawOverride::supportedDrawAPIs() const
 
 bool GaussianDrawOverride::isBounded(const MDagPath& objPath, const MDagPath&) const
 {
-    if (!m_node) return false;
-    GaussianDataNode* dn = m_node->findConnectedDataNode();
-    return (dn && dn->hasData());
+    return (m_node && m_node->hasData());
 }
 
 MBoundingBox GaussianDrawOverride::boundingBox(const MDagPath& objPath, const MDagPath&) const
 {
-    if (!m_node) return MBoundingBox(MPoint(-1,-1,-1), MPoint(1,1,1));
-    GaussianDataNode* dn = m_node->findConnectedDataNode();
-    if (!dn || !dn->hasData()) return MBoundingBox(MPoint(-1,-1,-1), MPoint(1,1,1));
-    return dn->boundingBox();
+    if (!m_node || !m_node->hasData()) return MBoundingBox(MPoint(-1,-1,-1), MPoint(1,1,1));
+    return m_node->boundingBox();
 }
 
 // ---------------------------------------------------------------------------
@@ -272,9 +268,6 @@ MUserData* GaussianDrawOverride::prepareForDraw(
             MGlobal::displayError("[GaussianSplat] Debug pipeline: FAILED");
     }
 
-    // Find connected data node
-    GaussianDataNode* dataNode = m_node->findConnectedDataNode();
-
     // Clear shared SRV refs each frame
     data->sharedSrvPositionWS = nullptr;
     data->sharedSrvScale      = nullptr;
@@ -285,30 +278,26 @@ MUserData* GaussianDrawOverride::prepareForDraw(
     data->vertexCount         = 0;
     data->registeredWithManager = false;
 
-    if (!dataNode) return data;
-
-    // Trigger data node compute (DG evaluation)
-    MPlug dataReadyPlug(dataNode->thisMObject(), GaussianDataNode::aDataReady);
+    // Trigger compute (DG evaluation: filePath -> dataReady)
+    MPlug dataReadyPlug(m_node->thisMObject(), GaussianNode::aDataReady);
     dataReadyPlug.asBool();
 
-    if (!dataNode->hasData()) return data;
+    if (!m_node->hasData()) return data;
 
-    // Lazy GPU upload of shared input buffers (in data node)
-    if (device) {
-        dataNode->uploadInputBuffersIfNeeded(device);
-    }
+    // Lazy GPU upload of input buffers (owned by this node)
+    if (device) m_node->uploadInputBuffersIfNeeded(device);
 
-    if (!dataNode->areInputsReady()) return data;
+    if (!m_node->areInputsReady()) return data;
 
-    // Copy non-owning SRV pointers from data node (for debug path)
-    data->sharedSrvPositionWS = dataNode->srvPositionWS();
-    data->sharedSrvScale      = dataNode->srvScale();
-    data->sharedSrvRotation   = dataNode->srvRotation();
-    data->sharedSrvOpacity    = dataNode->srvOpacity();
-    data->sharedSrvSHCoeffs   = dataNode->srvSHCoeffs();
+    // Copy non-owning SRV pointers (for debug path)
+    data->sharedSrvPositionWS = m_node->srvPositionWS();
+    data->sharedSrvScale      = m_node->srvScale();
+    data->sharedSrvRotation   = m_node->srvRotation();
+    data->sharedSrvOpacity    = m_node->srvOpacity();
+    data->sharedSrvSHCoeffs   = m_node->srvSHCoeffs();
     data->inputsReady         = true;
 
-    uint32_t N = dataNode->splatCount();
+    uint32_t N = m_node->splatCount();
     data->vertexCount = N;
 
     // Matrices
@@ -369,11 +358,11 @@ MUserData* GaussianDrawOverride::prepareForDraw(
     mgr.setFrameData(data->viewMat, data->projMat, data->cameraPos,
                      data->tanHalfFov, data->vpWidth, data->vpHeight);
 
-    // Register this instance. Deduplication (same dataNode already present)
-    // is handled inside registerInstance to prevent count multiplication when
+    // Register this instance. Deduplication (same node already present) is
+    // handled inside registerInstance to prevent count multiplication when
     // Maya calls prepareForDraw multiple times per logical frame.
     RenderInstance inst;
-    inst.dataNode   = dataNode;
+    inst.node       = m_node;
     inst.splatCount = N;
     std::memcpy(inst.worldMat, data->worldMat, 64);
     mgr.registerInstance(inst);

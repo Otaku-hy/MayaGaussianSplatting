@@ -1,6 +1,6 @@
 #define NOMINMAX
 #include "GaussianRenderManager.h"
-#include "GaussianDataNode.h"
+#include "GaussianNode.h"
 #include "GaussianData.h"
 
 #include <maya/MGlobal.h>
@@ -669,7 +669,7 @@ void GaussianRenderManager::registerInstance(const RenderInstance& inst) {
     // logical frame (picking/shadow/transparency passes). Prevent instance count
     // from multiplying while still allowing re-registration after beginFrame clears.
     for (const auto& existing : m_instances)
-        if (existing.dataNode == inst.dataNode) return;
+        if (existing.node == inst.node) return;
     m_instances.push_back(inst);
     m_totalSplats += inst.splatCount;
 }
@@ -906,7 +906,7 @@ bool GaussianRenderManager::initSelectPipeline(ID3D11Device* device) {
 // Called by gsMarqueeSelect command; rectMin/rectMax are in NDC space.
 // ---------------------------------------------------------------------------
 bool GaussianRenderManager::runSelection(ID3D11Device* /*device*/, ID3D11DeviceContext* ctx,
-                                         GaussianDataNode* node,
+                                         GaussianNode* node,
                                          const float worldMat[16],
                                          const float viewProj[16],
                                          float rectMinX, float rectMinY,
@@ -1120,7 +1120,7 @@ bool GaussianRenderManager::buildMergedInputs(ID3D11Device* device, ID3D11Device
     // Hash = XOR-combine of (dataNode pointer, splatCount) per instance.
     size_t sig = 0;
     for (uint32_t i = 0; i < numInstances; i++) {
-        auto ptr = reinterpret_cast<uintptr_t>(m_instances[i].dataNode);
+        auto ptr = reinterpret_cast<uintptr_t>(m_instances[i].node);
         sig ^= std::hash<uintptr_t>()(ptr) + 0x9e3779b9 + (sig << 6) + (sig >> 2);
         sig ^= std::hash<uint32_t>()(m_instances[i].splatCount) + 0x9e3779b9 + (sig << 6) + (sig >> 2);
     }
@@ -1138,7 +1138,7 @@ bool GaussianRenderManager::buildMergedInputs(ID3D11Device* device, ID3D11Device
 
         for (uint32_t i = 0; i < numInstances; i++) {
             const RenderInstance& inst = m_instances[i];
-            const GaussianData& gd = inst.dataNode->gaussianData();
+            const GaussianData& gd = inst.node->gaussianData();
             uint32_t cnt = inst.splatCount;
 
             mergedPos.insert(mergedPos.end(),
@@ -1246,7 +1246,7 @@ bool GaussianRenderManager::updateMergedSelection(ID3D11Device* device,
     bool anyChanged = m_selectionDirty;
     if (!anyChanged) {
         for (uint32_t i = 0; i < numInstances; i++) {
-            if (m_instanceMaskVersions[i] != m_instances[i].dataNode->maskVersion()) {
+            if (m_instanceMaskVersions[i] != m_instances[i].node->maskVersion()) {
                 anyChanged = true;
                 break;
             }
@@ -1258,7 +1258,7 @@ bool GaussianRenderManager::updateMergedSelection(ID3D11Device* device,
     uint32_t byteOffset = 0;
     for (uint32_t i = 0; i < numInstances; i++) {
         const RenderInstance& inst = m_instances[i];
-        GaussianDataNode* dn = inst.dataNode;
+        GaussianNode* dn = inst.node;
         uint32_t cnt = inst.splatCount;
         if (!dn->bufSelectionMask() || cnt == 0) {
             byteOffset += cnt * sizeof(uint32_t);

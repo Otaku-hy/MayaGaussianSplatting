@@ -2,7 +2,6 @@
 #include <maya/MGlobal.h>
 #include <maya/MDrawRegistry.h>
 #include "GaussianNode.h"
-#include "GaussianDataNode.h"
 #include "GaussianDrawOverride.h"
 #include "GaussianRenderManager.h"
 #include "GaussianSelection.h"
@@ -20,122 +19,141 @@ global proc gaussianSplat_buildMenu()
     menu -parent $gMainWindow -label "Gaussian Splatting" -tearOff true gaussianSplatMenu;
 
     menuItem -label "Load PLY File..."
-             -annotation "Create a data node and render node from a PLY file"
+             -annotation "Create a gaussianSplat node and load a PLY file into it"
              -command "gaussianSplat_loadPLY";
 
-    menuItem -divider true;
-
-    menuItem -label "Create Data Node"
-             -annotation "Create an empty gaussianSplatData node"
-             -command "gaussianSplat_createDataNode";
-
-    menuItem -label "Create Render Node"
-             -annotation "Create a gaussianSplat render node"
-             -command "gaussianSplat_createRenderNode";
-
-    menuItem -divider true;
-
-    menuItem -label "Connect Selected (Data -> Render)"
-             -annotation "Connect first selected data node to second selected render node"
-             -command "gaussianSplat_connectSelected";
+    menuItem -label "Create Gaussian Splat Node"
+             -annotation "Create an empty gaussianSplat node (set filePath in AE)"
+             -command "gaussianSplat_createNode";
 
     menuItem -divider true -dividerLabel "Selection / Editing";
 
     menuItem -label "Marquee Select Tool"
-             -annotation "Activate the Gaussian Splat marquee select tool (drag a rectangle in the viewport)"
+             -annotation "Drag a rectangle in the viewport to select splats (scope: selected node or all)"
              -command "gaussianSplat_activateMarquee";
 
     menuItem -label "Clear Selection"
-             -annotation "Unselect all splats on every gaussianSplatData node"
+             -annotation "Unselect all splats on all nodes"
              -command "gsClearSelection";
 
     menuItem -label "Delete Selected (soft)"
-             -annotation "Soft-delete currently selected splats (hidden until restored or saved out)"
+             -annotation "Soft-delete selected splats (hidden, restorable)"
              -command "gsDeleteSelected";
 
     menuItem -label "Restore All"
-             -annotation "Clear both selection and deleted bits on every data node"
+             -annotation "Clear both selection and deleted bits on all nodes"
              -command "gsRestoreAll";
 
     menuItem -divider true;
 
     menuItem -label "Save PLY As..."
-             -annotation "Save the (mask-filtered) data node to a binary PLY file"
+             -annotation "Save the (non-deleted) splats of the selected node to a PLY file"
              -command "gaussianSplat_savePLY";
 }
 
 global proc gaussianSplat_activateMarquee()
 {
-    // Always destroy the old instance first so that after a plugin reload the
-    // new DLL's makeObj() is called (stale context objects survive unloadPlugin).
+    // Always destroy the old instance so that after plugin reload the new
+    // DLL's makeObj() is called (stale context objects survive unloadPlugin).
     if (`contextInfo -exists gsMarqueeCtx1`)
         deleteUI gsMarqueeCtx1;
     gsMarqueeCtx gsMarqueeCtx1;
     setToolTo gsMarqueeCtx1;
-    print "// Gaussian Marquee tool active. Drag in the viewport.\n";
+    print "// Gaussian Marquee tool active. Drag in the viewport to select splats.\n";
+    print "// Tip: select a gaussianSplat node first to scope selection to that cloud only.\n";
 }
 
 // ---------------------------------------------------------------------------
-// Attribute Editor template for gaussianSplatData — adds a Restore All button.
+// Attribute Editor template for gaussianSplat.
+// Shows filePath + per-node editing buttons (Restore All, Delete Selected,
+// Save PLY As).
 // ---------------------------------------------------------------------------
-global proc AEgaussianSplatDataTemplate(string $nodeName)
+global proc AEgaussianSplatTemplate(string $nodeName)
 {
     editorTemplate -beginScrollLayout;
-        editorTemplate -beginLayout "Data" -collapse 0;
+
+        editorTemplate -beginLayout "Point Cloud Data" -collapse 0;
             editorTemplate -addControl "filePath";
-            editorTemplate -addSeparator;
+        editorTemplate -endLayout;
+
+        editorTemplate -beginLayout "Display" -collapse 0;
+            editorTemplate -addControl "pointSize";
+            editorTemplate -addControl "renderMode";
+        editorTemplate -endLayout;
+
+        editorTemplate -beginLayout "Selection / Editing" -collapse 0;
+            // Pass "" so Maya calls procs with "nodeName." — we parse nodeName ourselves.
             editorTemplate -callCustom
-                "AEgaussianSplatData_restoreNew"
-                "AEgaussianSplatData_restoreReplace"
+                "AEgaussianSplat_editNew"
+                "AEgaussianSplat_editReplace"
                 "";
         editorTemplate -endLayout;
+
         editorTemplate -addExtraControls;
     editorTemplate -endScrollLayout;
+
+    // Suppress attributes already shown above
+    editorTemplate -suppress "dataReady";
 }
 
-global proc AEgaussianSplatData_restoreNew(string $dummy)
+// callCustom passes "nodeName." (trailing dot when attribute is empty).
+// Parse the node name from that string.
+global proc string AEgaussianSplat_nodeName(string $nodeAttr)
 {
-    rowLayout -nc 2 -cw2 160 220 -cl2 "left" "left" gsRestoreRow;
-        text -label "Selection / Deletion:";
-        button -label "Restore All (clear mask)"
-               -annotation "Clear both selected and deleted bits; all splats visible again"
-               -command "AEgaussianSplatData_restoreCB"
+    string $parts[] = stringToStringArray($nodeAttr, ".");
+    return $parts[0];
+}
+
+global proc AEgaussianSplat_editNew(string $nodeAttr)
+{
+    string $n = AEgaussianSplat_nodeName($nodeAttr);
+    columnLayout -adj true gsEditCol;
+        button -label "Restore All  (clear selection + deleted)"
+               -annotation "Reveal all hidden splats on this node"
+               -command ("gsRestoreAll -node " + $n)
                gsRestoreBtn;
+        button -label "Delete Selected  (soft-hide)"
+               -annotation "Hide the currently selected splats (restorable)"
+               -command "gsDeleteSelected"
+               gsDeleteBtn;
+        separator -height 8;
+        button -label "Save PLY As..."
+               -annotation "Export non-deleted splats to a PLY file"
+               -command ("AEgaussianSplat_saveCB " + $n)
+               gsSaveBtn;
     setParent ..;
 }
 
-global proc AEgaussianSplatData_restoreReplace(string $dummy)
+global proc AEgaussianSplat_editReplace(string $nodeAttr)
 {
-    // No per-node plug to refresh -- the button is stateless.
-    if (!`button -exists gsRestoreBtn`) AEgaussianSplatData_restoreNew($dummy);
+    if (!`button -exists gsRestoreBtn`) { AEgaussianSplat_editNew($nodeAttr); return; }
+    string $n = AEgaussianSplat_nodeName($nodeAttr);
+    button -e -command ("gsRestoreAll -node " + $n)       gsRestoreBtn;
+    button -e -command  "gsDeleteSelected"                 gsDeleteBtn;
+    button -e -command ("AEgaussianSplat_saveCB " + $n)   gsSaveBtn;
 }
 
-global proc AEgaussianSplatData_restoreCB()
+global proc AEgaussianSplat_saveCB(string $nodeName)
 {
-    // Target the node that owns this AE -- use the current selection
-    // restricted to gaussianSplatData.
-    string $sel[] = `ls -selection -type gaussianSplatData`;
-    if (size($sel) == 0) {
-        // Fall back to all data nodes
-        gsRestoreAll;
-        return;
-    }
-    for ($n in $sel) gsRestoreAll -node $n;
+    string $files[] = `fileDialog2 -fileMode 0
+                                   -caption "Save Gaussian Splatting PLY"
+                                   -fileFilter "PLY Files (*.ply);;All Files (*.*)"`;
+    if (size($files) == 0) return;
+    gsSavePLY -node $nodeName -file $files[0];
 }
 
 global proc gaussianSplat_savePLY()
 {
-    string $nodes[] = `ls -type gaussianSplatData`;
-    if (size($nodes) == 0) {
-        warning "No gaussianSplatData in scene.";
-        return;
+    // Menu version: prefer selected gaussianSplat node, otherwise first in scene.
+    string $shapes[] = `ls -selection -dag -type gaussianSplat`;
+    string $node = "";
+    if (size($shapes) > 0) {
+        $node = $shapes[0];
+    } else {
+        string $all[] = `ls -type gaussianSplat`;
+        if (size($all) == 0) { warning "No gaussianSplat in scene."; return; }
+        $node = $all[0];
     }
-    string $node = $nodes[0];
-    if (size($nodes) > 1) {
-        string $sel[] = `ls -selection -type gaussianSplatData`;
-        if (size($sel) > 0) $node = $sel[0];
-    }
-
     string $files[] = `fileDialog2 -fileMode 0
                                    -caption "Save Gaussian Splatting PLY"
                                    -fileFilter "PLY Files (*.ply);;All Files (*.*)"`;
@@ -156,89 +174,30 @@ global proc gaussianSplat_loadPLY()
                                    -fileFilter "PLY Files (*.ply);;All Files (*.*)"`;
     if (size($files) == 0) return;
 
-    string $dataNode = `createNode gaussianSplatData`;
-    setAttr -type "string" ($dataNode + ".filePath") $files[0];
-
+    // Each load creates an independent gaussianSplat node with its own data.
     string $transform = `createNode transform -name "gaussianSplat1"`;
-    string $renderNode = `createNode gaussianSplat -parent $transform`;
-
-    connectAttr ($dataNode + ".outputData") ($renderNode + ".inputData");
+    string $node      = `createNode gaussianSplat -parent $transform`;
+    setAttr -type "string" ($node + ".filePath") $files[0];
 
     select -r $transform;
-    print ("// Created: " + $dataNode + " -> " + $renderNode + "\n");
+    print ("// Created: " + $node + " (filePath=" + $files[0] + ")\n");
 }
 
-global proc gaussianSplat_createDataNode()
-{
-    string $node = `createNode gaussianSplatData`;
-    select -r $node;
-    print ("// Created data node: " + $node + "\n");
-}
-
-global proc gaussianSplat_createRenderNode()
+global proc gaussianSplat_createNode()
 {
     string $transform = `createNode transform -name "gaussianSplat1"`;
-    string $node = `createNode gaussianSplat -parent $transform`;
+    string $node      = `createNode gaussianSplat -parent $transform`;
     select -r $transform;
-    print ("// Created render node: " + $node + " (under " + $transform + ")\n");
-}
-
-global proc gaussianSplat_connectSelected()
-{
-    string $sel[] = `ls -selection`;
-    if (size($sel) < 2) {
-        warning "Select a gaussianSplatData node first, then a gaussianSplat node (or its transform).";
-        return;
-    }
-
-    string $dataNode = $sel[0];
-    string $renderTarget = $sel[1];
-
-    // If the second selection is a transform, find the shape underneath
-    string $renderNode = $renderTarget;
-    if (`nodeType $renderTarget` == "transform") {
-        string $shapes[] = `listRelatives -shapes -type "gaussianSplat" $renderTarget`;
-        if (size($shapes) == 0) {
-            warning ("No gaussianSplat shape found under " + $renderTarget);
-            return;
-        }
-        $renderNode = $shapes[0];
-    }
-
-    if (`nodeType $dataNode` != "gaussianSplatData") {
-        warning ($dataNode + " is not a gaussianSplatData node.");
-        return;
-    }
-    if (`nodeType $renderNode` != "gaussianSplat") {
-        warning ($renderNode + " is not a gaussianSplat node.");
-        return;
-    }
-
-    connectAttr -force ($dataNode + ".outputData") ($renderNode + ".inputData");
-    print ("// Connected: " + $dataNode + " -> " + $renderNode + "\n");
+    print ("// Created: " + $node + " -- set filePath in the Attribute Editor\n");
 }
 )MEL";
 
 // ---------------------------------------------------------------------------
 EXPORT MStatus initializePlugin(MObject obj) {
-    MFnPlugin plugin(obj, "CIS6600 Team", "0.2", "Any");
+    MFnPlugin plugin(obj, "CIS6600 Team", "0.3", "Any");
 
-    // Register the data node (non-locator DG node)
+    // Register the self-contained gaussianSplat locator node
     MStatus status = plugin.registerNode(
-        GaussianDataNode::typeName,
-        GaussianDataNode::typeId,
-        GaussianDataNode::creator,
-        GaussianDataNode::initialize,
-        MPxNode::kDependNode);
-
-    if (!status) {
-        MGlobal::displayError(
-            "[GaussianSplat] registerNode(gaussianSplatData) failed: " + status.errorString());
-        return status;
-    }
-
-    // Register the locator render node
-    status = plugin.registerNode(
         GaussianNode::typeName,
         GaussianNode::typeId,
         GaussianNode::creator,
@@ -249,7 +208,6 @@ EXPORT MStatus initializePlugin(MObject obj) {
     if (!status) {
         MGlobal::displayError(
             "[GaussianSplat] registerNode(gaussianSplat) failed: " + status.errorString());
-        plugin.deregisterNode(GaussianDataNode::typeId);
         return status;
     }
 
@@ -263,7 +221,6 @@ EXPORT MStatus initializePlugin(MObject obj) {
         MGlobal::displayError(
             "[GaussianSplat] registerDrawOverrideCreator failed: " + status.errorString());
         plugin.deregisterNode(GaussianNode::typeId);
-        plugin.deregisterNode(GaussianDataNode::typeId);
         return status;
     }
 
@@ -314,7 +271,6 @@ EXPORT MStatus uninitializePlugin(MObject obj) {
         GaussianNode::drawRegistrantId);
 
     plugin.deregisterNode(GaussianNode::typeId);
-    plugin.deregisterNode(GaussianDataNode::typeId);
 
     MGlobal::displayInfo("[GaussianSplat] Plugin unloaded.");
     return MS::kSuccess;
