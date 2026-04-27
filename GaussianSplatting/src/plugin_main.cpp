@@ -4,6 +4,8 @@
 #include "GaussianNode.h"
 #include "GaussianDataNode.h"
 #include "GaussianDrawOverride.h"
+#include "GaussianRenderManager.h"
+#include "GaussianSelection.h"
 
 #define EXPORT __declspec(dllexport)
 
@@ -36,6 +38,109 @@ global proc gaussianSplat_buildMenu()
     menuItem -label "Connect Selected (Data -> Render)"
              -annotation "Connect first selected data node to second selected render node"
              -command "gaussianSplat_connectSelected";
+
+    menuItem -divider true -dividerLabel "Selection / Editing";
+
+    menuItem -label "Marquee Select Tool"
+             -annotation "Activate the Gaussian Splat marquee select tool (drag a rectangle in the viewport)"
+             -command "gaussianSplat_activateMarquee";
+
+    menuItem -label "Clear Selection"
+             -annotation "Unselect all splats on every gaussianSplatData node"
+             -command "gsClearSelection";
+
+    menuItem -label "Delete Selected (soft)"
+             -annotation "Soft-delete currently selected splats (hidden until restored or saved out)"
+             -command "gsDeleteSelected";
+
+    menuItem -label "Restore All"
+             -annotation "Clear both selection and deleted bits on every data node"
+             -command "gsRestoreAll";
+
+    menuItem -divider true;
+
+    menuItem -label "Save PLY As..."
+             -annotation "Save the (mask-filtered) data node to a binary PLY file"
+             -command "gaussianSplat_savePLY";
+}
+
+global proc gaussianSplat_activateMarquee()
+{
+    // Always destroy the old instance first so that after a plugin reload the
+    // new DLL's makeObj() is called (stale context objects survive unloadPlugin).
+    if (`contextInfo -exists gsMarqueeCtx1`)
+        deleteUI gsMarqueeCtx1;
+    gsMarqueeCtx gsMarqueeCtx1;
+    setToolTo gsMarqueeCtx1;
+    print "// Gaussian Marquee tool active. Drag in the viewport.\n";
+}
+
+// ---------------------------------------------------------------------------
+// Attribute Editor template for gaussianSplatData — adds a Restore All button.
+// ---------------------------------------------------------------------------
+global proc AEgaussianSplatDataTemplate(string $nodeName)
+{
+    editorTemplate -beginScrollLayout;
+        editorTemplate -beginLayout "Data" -collapse 0;
+            editorTemplate -addControl "filePath";
+            editorTemplate -addSeparator;
+            editorTemplate -callCustom
+                "AEgaussianSplatData_restoreNew"
+                "AEgaussianSplatData_restoreReplace"
+                "";
+        editorTemplate -endLayout;
+        editorTemplate -addExtraControls;
+    editorTemplate -endScrollLayout;
+}
+
+global proc AEgaussianSplatData_restoreNew(string $dummy)
+{
+    rowLayout -nc 2 -cw2 160 220 -cl2 "left" "left" gsRestoreRow;
+        text -label "Selection / Deletion:";
+        button -label "Restore All (clear mask)"
+               -annotation "Clear both selected and deleted bits; all splats visible again"
+               -command "AEgaussianSplatData_restoreCB"
+               gsRestoreBtn;
+    setParent ..;
+}
+
+global proc AEgaussianSplatData_restoreReplace(string $dummy)
+{
+    // No per-node plug to refresh -- the button is stateless.
+    if (!`button -exists gsRestoreBtn`) AEgaussianSplatData_restoreNew($dummy);
+}
+
+global proc AEgaussianSplatData_restoreCB()
+{
+    // Target the node that owns this AE -- use the current selection
+    // restricted to gaussianSplatData.
+    string $sel[] = `ls -selection -type gaussianSplatData`;
+    if (size($sel) == 0) {
+        // Fall back to all data nodes
+        gsRestoreAll;
+        return;
+    }
+    for ($n in $sel) gsRestoreAll -node $n;
+}
+
+global proc gaussianSplat_savePLY()
+{
+    string $nodes[] = `ls -type gaussianSplatData`;
+    if (size($nodes) == 0) {
+        warning "No gaussianSplatData in scene.";
+        return;
+    }
+    string $node = $nodes[0];
+    if (size($nodes) > 1) {
+        string $sel[] = `ls -selection -type gaussianSplatData`;
+        if (size($sel) > 0) $node = $sel[0];
+    }
+
+    string $files[] = `fileDialog2 -fileMode 0
+                                   -caption "Save Gaussian Splatting PLY"
+                                   -fileFilter "PLY Files (*.ply);;All Files (*.*)"`;
+    if (size($files) == 0) return;
+    gsSavePLY -node $node -file $files[0];
 }
 
 global proc gaussianSplat_removeMenu()
@@ -162,6 +267,23 @@ EXPORT MStatus initializePlugin(MObject obj) {
         return status;
     }
 
+    // --- Selection / editing commands + marquee context ---
+    plugin.registerCommand(GSMarqueeSelectCmd::commandName,
+                           GSMarqueeSelectCmd::creator,
+                           GSMarqueeSelectCmd::newSyntax);
+    plugin.registerCommand(GSClearSelectionCmd::commandName,
+                           GSClearSelectionCmd::creator);
+    plugin.registerCommand(GSDeleteSelectedCmd::commandName,
+                           GSDeleteSelectedCmd::creator);
+    plugin.registerCommand(GSRestoreAllCmd::commandName,
+                           GSRestoreAllCmd::creator,
+                           GSRestoreAllCmd::newSyntax);
+    plugin.registerCommand(GSSavePLYCmd::commandName,
+                           GSSavePLYCmd::creator,
+                           GSSavePLYCmd::newSyntax);
+    plugin.registerContextCommand(GSMarqueeContextCmd::commandName,
+                                   GSMarqueeContextCmd::creator);
+
     // Build menu via MEL
     MGlobal::executeCommand(kBuildMenuMel);
     MGlobal::executeCommand("gaussianSplat_buildMenu");
@@ -176,6 +298,16 @@ EXPORT MStatus uninitializePlugin(MObject obj) {
 
     // Remove menu
     MGlobal::executeCommand("gaussianSplat_removeMenu");
+
+    // Release merged render manager resources before deregistering nodes
+    GaussianRenderManager::instance().releaseAll();
+
+    plugin.deregisterContextCommand(GSMarqueeContextCmd::commandName);
+    plugin.deregisterCommand(GSSavePLYCmd::commandName);
+    plugin.deregisterCommand(GSRestoreAllCmd::commandName);
+    plugin.deregisterCommand(GSDeleteSelectedCmd::commandName);
+    plugin.deregisterCommand(GSClearSelectionCmd::commandName);
+    plugin.deregisterCommand(GSMarqueeSelectCmd::commandName);
 
     MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(
         GaussianNode::drawDbClassification,

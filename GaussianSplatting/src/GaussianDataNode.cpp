@@ -7,6 +7,9 @@
 #include <maya/MFnData.h>
 #include <maya/MGlobal.h>
 
+#include <algorithm>
+#include <cstring>
+
 // ---------------------------------------------------------------------------
 // Static member definitions
 // ---------------------------------------------------------------------------
@@ -115,7 +118,117 @@ void GaussianDataNode::releaseInputBuffers()
     SAFE_RELEASE(m_sbRotation);   SAFE_RELEASE(m_srvRotation);
     SAFE_RELEASE(m_sbOpacity);    SAFE_RELEASE(m_srvOpacity);
     SAFE_RELEASE(m_sbSHCoeffs);   SAFE_RELEASE(m_srvSHCoeffs);
+    releaseSelectionMaskBuffer();
     m_inputsReady = false;
+}
+
+void GaussianDataNode::releaseSelectionMaskBuffer()
+{
+    SAFE_RELEASE(m_uavSelectionMask);
+    SAFE_RELEASE(m_srvSelectionMask);
+    SAFE_RELEASE(m_sbSelectionMask);
+    m_maskShadow.clear();
+}
+
+bool GaussianDataNode::createSelectionMaskBuffer(ID3D11Device* device, uint32_t N)
+{
+    releaseSelectionMaskBuffer();
+    m_maskShadow.assign(N, 0u);
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth           = N * sizeof(uint32_t);
+    bd.Usage               = D3D11_USAGE_DEFAULT;
+    bd.BindFlags           = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = sizeof(uint32_t);
+
+    D3D11_SUBRESOURCE_DATA init = { m_maskShadow.data(), 0, 0 };
+    if (FAILED(device->CreateBuffer(&bd, &init, &m_sbSelectionMask))) {
+        MGlobal::displayError("[GaussianSplatData] CreateBuffer failed for selectionMask.");
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.ViewDimension         = D3D11_SRV_DIMENSION_BUFFEREX;
+    srvd.BufferEx.FirstElement = 0;
+    srvd.BufferEx.NumElements  = N;
+    if (FAILED(device->CreateShaderResourceView(m_sbSelectionMask, &srvd, &m_srvSelectionMask))) {
+        releaseSelectionMaskBuffer();
+        return false;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {};
+    uavd.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
+    uavd.Buffer.FirstElement = 0;
+    uavd.Buffer.NumElements  = N;
+    if (FAILED(device->CreateUnorderedAccessView(m_sbSelectionMask, &uavd, &m_uavSelectionMask))) {
+        releaseSelectionMaskBuffer();
+        return false;
+    }
+
+    m_maskVersion++;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Selection mask helpers
+// ---------------------------------------------------------------------------
+void GaussianDataNode::restoreAll(ID3D11DeviceContext* ctx)
+{
+    if (!m_sbSelectionMask || m_maskShadow.empty()) return;
+    std::fill(m_maskShadow.begin(), m_maskShadow.end(), 0u);
+    ctx->UpdateSubresource(m_sbSelectionMask, 0, nullptr, m_maskShadow.data(), 0, 0);
+    m_maskVersion++;
+}
+
+void GaussianDataNode::clearSelection(ID3D11DeviceContext* ctx)
+{
+    if (!m_sbSelectionMask || m_maskShadow.empty()) return;
+    for (auto& v : m_maskShadow) v &= ~kMaskBitSelected;
+    ctx->UpdateSubresource(m_sbSelectionMask, 0, nullptr, m_maskShadow.data(), 0, 0);
+    m_maskVersion++;
+}
+
+void GaussianDataNode::deleteSelected(ID3D11DeviceContext* ctx)
+{
+    if (!m_sbSelectionMask || m_maskShadow.empty()) return;
+    // NOTE: operates on CPU shadow. If a selection CS has written the GPU
+    // buffer since last readback, the caller should readbackMask() first.
+    uint32_t numDeleted = 0;
+    for (auto& v : m_maskShadow) {
+        if (v & kMaskBitSelected) {
+            v = (v & ~kMaskBitSelected) | kMaskBitDeleted;
+            numDeleted++;
+        }
+    }
+    ctx->UpdateSubresource(m_sbSelectionMask, 0, nullptr, m_maskShadow.data(), 0, 0);
+    m_maskVersion++;
+    MGlobal::displayInfo(MString("[GaussianSplatData] Soft-deleted ") +
+                         (unsigned)numDeleted + " splats.");
+}
+
+bool GaussianDataNode::readbackMask(ID3D11Device* device, ID3D11DeviceContext* ctx)
+{
+    if (!m_sbSelectionMask || m_maskShadow.empty()) return false;
+
+    ID3D11Buffer* staging = nullptr;
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth      = (UINT)(m_maskShadow.size() * sizeof(uint32_t));
+    bd.Usage          = D3D11_USAGE_STAGING;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateBuffer(&bd, nullptr, &staging))) return false;
+
+    ctx->CopyResource(staging, m_sbSelectionMask);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+        staging->Release();
+        return false;
+    }
+    std::memcpy(m_maskShadow.data(), mapped.pData, bd.ByteWidth);
+    ctx->Unmap(staging, 0);
+    staging->Release();
+    return true;
 }
 
 bool GaussianDataNode::createSRVBuffer(ID3D11Device* device,
@@ -172,6 +285,9 @@ bool GaussianDataNode::uploadInputBuffersIfNeeded(ID3D11Device* device)
     if (!createSRVBuffer(device, "rotation",   m_data.rotationWS.data(), N, sizeof(float)*4, &m_sbRotation,   &m_srvRotation))   return false;
     if (!createSRVBuffer(device, "opacity",    m_data.opacityRaw.data(), N, sizeof(float),   &m_sbOpacity,    &m_srvOpacity))    return false;
     if (!createSRVBuffer(device, "shCoeffs",   m_data.shCoeffs.data(), N * kSHCoeffsPerSplat, sizeof(float)*3, &m_sbSHCoeffs, &m_srvSHCoeffs)) return false;
+
+    // Selection mask: zero-initialized, one uint per splat
+    if (!createSelectionMaskBuffer(device, N)) return false;
 
     m_inputsReady = true;
     m_inputsDirty = false;

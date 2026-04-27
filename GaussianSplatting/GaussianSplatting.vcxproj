@@ -97,6 +97,8 @@
     <ClCompile Include="src\GaussianDataNode.cpp" />
     <ClCompile Include="src\GaussianDrawOverride.cpp" />
     <ClCompile Include="src\GaussianNode.cpp" />
+    <ClCompile Include="src\GaussianRenderManager.cpp" />
+    <ClCompile Include="src\GaussianSelection.cpp" />
     <ClCompile Include="src\plugin_main.cpp" />
     <ClCompile Include="src\PLYReader.cpp" />
   </ItemGroup>
@@ -105,6 +107,8 @@
     <ClInclude Include="src\GaussianDataNode.h" />
     <ClInclude Include="src\GaussianDrawOverride.h" />
     <ClInclude Include="src\GaussianNode.h" />
+    <ClInclude Include="src\GaussianRenderManager.h" />
+    <ClInclude Include="src\GaussianSelection.h" />
     <ClInclude Include="src\PLYReader.h" />
   </ItemGroup>
   <ItemGroup>

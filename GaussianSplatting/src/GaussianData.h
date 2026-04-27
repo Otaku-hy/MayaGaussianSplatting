@@ -1,9 +1,16 @@
 #pragma once
 #include <vector>
+#include <cstdint>
 #include <cstddef>
 
 // Number of SH coefficients per channel stored per splat (degree 0..3 = 16 groups)
 static constexpr int kSHCoeffsPerSplat = 16;
+
+// Selection mask bit layout (1 uint per splat, shared CPU/GPU).
+// bit 0: selected   -- highlighted in viewport
+// bit 1: deleted    -- soft-deleted (radius=0 in preprocess, skipped on save)
+static constexpr uint32_t kMaskBitSelected = 1u;
+static constexpr uint32_t kMaskBitDeleted  = 2u;
 
 // Raw per-splat data as parsed from PLY
 struct GaussianSplat {
