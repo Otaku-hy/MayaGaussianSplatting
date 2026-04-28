@@ -17,3 +17,4 @@ x86/
 *.vcxproj.user
 CLAUDE.md
 *.vcxproj
+*.pdf
