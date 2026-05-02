@@ -5,6 +5,7 @@
 #include "GaussianDrawOverride.h"
 #include "GaussianRenderManager.h"
 #include "GaussianSelection.h"
+#include "ShaderLoader.h"
 
 #define EXPORT __declspec(dllexport)
 
@@ -195,6 +196,10 @@ global proc gaussianSplat_createNode()
 // ---------------------------------------------------------------------------
 EXPORT MStatus initializePlugin(MObject obj) {
     MFnPlugin plugin(obj, "CIS6600 Team", "0.3", "Any");
+
+    // Capture plugin install dir so ShaderLoader can find shaders/*.hlsl
+    // (CMake post-build copies the shaders/ folder next to the .mll).
+    gs::SetPluginDir(plugin.loadPath().asChar());
 
     // Register the self-contained gaussianSplat locator node
     MStatus status = plugin.registerNode(

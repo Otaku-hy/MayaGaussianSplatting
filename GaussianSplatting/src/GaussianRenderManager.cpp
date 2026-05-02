@@ -2,6 +2,7 @@
 #include "GaussianRenderManager.h"
 #include "GaussianNode.h"
 #include "GaussianData.h"
+#include "ShaderLoader.h"
 
 #include <maya/MGlobal.h>
 
@@ -14,539 +15,19 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <string>
 
 // ===========================================================================
-// Merged Preprocessing compute shader HLSL
-//   Difference from single-instance version:
-//     - worldMat removed from CB
-//     - Added gInstanceID (t5) and gWorldMats (t6) StructuredBuffers
-//     - PreprocessKernel looks up world matrix per-splat via instanceID
+// HLSL shader sources have moved to GaussianSplatting/shaders/*.hlsl.
+// They are loaded at runtime via gs::LoadShader() (see ShaderLoader.h).
+// CMake copies the shaders/ folder next to the .mll on build.
+//   merged_preprocess.hlsl   (kMergedPreprocessCS)
+//   production.hlsl          (kProdShaderSrc)
+//   radix_sort.hlsl          (kRadixSortCS, with -DKEYGEN/COUNT/SCAN/SCATTER)
+//   depth_pass.hlsl          (kDepthPassCS, with -DCLEAR_DEPTH/DEPTH_PASS)
+//   select.hlsl              (kSelectCS)
+//   depth_copy.hlsl          (kDepthCopyShader)
 // ===========================================================================
-static const char* kMergedPreprocessCS = R"HLSL(
-StructuredBuffer<float3> gPositionWS  : register(t0);
-StructuredBuffer<float3> gScale       : register(t1);
-StructuredBuffer<float4> gRotation    : register(t2);
-StructuredBuffer<float>  gOpacity     : register(t3);
-StructuredBuffer<float3> gSHsCoeff    : register(t4);
-StructuredBuffer<uint>   gInstanceID  : register(t5);
-// World matrices stored as 4 x float4 rows (row-major, matching Maya convention)
-struct Float4x4 { float4 r0, r1, r2, r3; };
-StructuredBuffer<Float4x4> gWorldMats : register(t6);
-// Per-splat selection mask: bit 0 = selected, bit 1 = deleted
-StructuredBuffer<uint>   gMask        : register(t7);
-
-RWStructuredBuffer<float2> gPositionSS    : register(u0);
-RWStructuredBuffer<float>  gDepth         : register(u1);
-RWStructuredBuffer<float>  gRadius        : register(u2);
-RWStructuredBuffer<float3> gColor         : register(u3);
-RWStructuredBuffer<float4> gCov2D_opacity : register(u4);
-
-cbuffer PreprocessParams : register(b0)
-{
-    row_major float4x4 viewMat;
-    row_major float4x4 projMat;
-    float3   cameraPos;
-    float    padding0;
-    float2   tanHalfFov;
-    int      filmWidth;
-    int      filmHeight;
-    uint     gGaussCounts;
-    uint     debugFixedRadius;
-    float    pad2; float pad3;
-};
-
-float3x3 Get3DCovariance(float3 scale, float4 rotation)
-{
-    float r = rotation.x;
-    float x = rotation.y;
-    float y = rotation.z;
-    float z = rotation.w;
-
-    float3x3 R = float3x3(
-        1 - 2*(y*y + z*z),  2*(x*y - r*z),      2*(x*z + r*y),
-        2*(x*y + r*z),      1 - 2*(x*x + z*z),  2*(y*z - r*x),
-        2*(x*z - r*y),      2*(y*z + r*x),      1 - 2*(x*x + y*y)
-    );
-    float3x3 S = float3x3(
-        scale.x*scale.x, 0, 0,
-        0, scale.y*scale.y, 0,
-        0, 0, scale.z*scale.z
-    );
-    return mul(R, mul(S, transpose(R)));
-}
-
-float3 Get2DCovariance(float3x3 cov3D, float3 meanVS)
-{
-    float focalX = 0.5f * (float)filmWidth  / tanHalfFov.x;
-    float focalY = 0.5f * (float)filmHeight / tanHalfFov.y;
-
-    float limX = 1.3f * tanHalfFov.x;
-    float limY = 1.3f * tanHalfFov.y;
-    float3 mv  = meanVS;
-    mv.x = clamp(mv.x / mv.z, -limX, limX) * mv.z;
-    mv.y = clamp(mv.y / mv.z, -limY, limY) * mv.z;
-
-    float3x3 J = float3x3(
-        focalX / mv.z, 0.0f,          -focalX * mv.x / (mv.z * mv.z),
-        0.0f,          focalY / mv.z, -focalY * mv.y / (mv.z * mv.z),
-        0.0f,          0.0f,           0.0f
-    );
-
-    float3x3 W   = transpose((float3x3)viewMat);
-    float3x3 T   = mul(J, W);
-    float3x3 cov = mul(T, mul(cov3D, transpose(T)));
-
-    return float3(cov[0][0] + 0.3f, cov[0][1], cov[1][1] + 0.3f);
-}
-
-float3 ComputeSphericalHarmonics(uint idx, float3 position, float3 camPos)
-{
-    uint shBaseIdx = idx * 16;
-    float3 dir = normalize(position - camPos);
-
-    float3 shColor = gSHsCoeff[shBaseIdx + 0] * 0.282095f;
-
-    shColor += gSHsCoeff[shBaseIdx + 1] * -0.488603f * dir.y;
-    shColor += gSHsCoeff[shBaseIdx + 2] *  0.488603f * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 3] * -0.488603f * dir.x;
-
-    shColor += gSHsCoeff[shBaseIdx + 4] *  1.092548f * dir.x * dir.y;
-    shColor += gSHsCoeff[shBaseIdx + 5] * -1.092548f * dir.y * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 6] *  0.315392f * (3.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 7] * -1.092548f * dir.x * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 8] *  0.546274f * (dir.x * dir.x - dir.y * dir.y);
-
-    shColor += gSHsCoeff[shBaseIdx + 9]  * -0.590044f * dir.y * (3.0f * dir.x * dir.x - dir.y * dir.y);
-    shColor += gSHsCoeff[shBaseIdx + 10] *  2.890611f * dir.x * dir.y * dir.z;
-    shColor += gSHsCoeff[shBaseIdx + 11] * -0.457046f * dir.y * (5.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 12] *  0.373176f * (5.0f * dir.z * dir.z * dir.z - 3.0f * dir.z);
-    shColor += gSHsCoeff[shBaseIdx + 13] * -0.457046f * dir.x * (5.0f * dir.z * dir.z - 1.0f);
-    shColor += gSHsCoeff[shBaseIdx + 14] *  1.445305f * dir.z * (dir.x * dir.x - dir.y * dir.y);
-    shColor += gSHsCoeff[shBaseIdx + 15] * -0.590044f * dir.x * (dir.x * dir.x - 3.0f * dir.y * dir.y);
-
-    shColor += 0.5f;
-    return max(shColor, 0.0f);
-}
-
-[numthreads(256, 1, 1)]
-void PreprocessKernel(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= gGaussCounts) return;
-
-    // Deleted splats: emit zero-radius so they are skipped downstream.
-    uint mask = gMask[id.x];
-    if (mask & 2u) { gRadius[id.x] = 0.0f; return; }
-
-    // Look up per-splat world matrix via instance ID
-    uint inst = gInstanceID[id.x];
-    Float4x4 wm = gWorldMats[inst];
-    float4x4 worldMat = float4x4(wm.r0, wm.r1, wm.r2, wm.r3);
-
-    float3 posOS = gPositionWS[id.x];
-    float3 posWS = mul(float4(posOS, 1.0f), worldMat).xyz;
-
-    float4 posVS = mul(float4(posWS, 1.0f), viewMat);
-
-    if (posVS.z >= -0.2f) {
-        gRadius[id.x] = 0.0f;
-        return;
-    }
-
-    float4 posCS  = mul(posVS, projMat);
-    float2 posNDC = posCS.xy / posCS.w;
-    float2 posSS  = (posNDC * 0.5f + 0.5f) * float2((float)filmWidth, (float)filmHeight);
-
-    float3x3 cov3D_obj = Get3DCovariance(gScale[id.x], gRotation[id.x]);
-    float3x3 W3x3      = (float3x3)worldMat;
-    float3x3 cov3D     = mul(transpose(W3x3), mul(cov3D_obj, W3x3));
-
-    float3   cov2D = Get2DCovariance(cov3D, posVS.xyz);
-
-    float det    = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
-    if (det <= 0.0f) { gRadius[id.x] = 0.0f; return; }
-
-    float mid    = 0.5f * (cov2D.x + cov2D.z);
-    float lambda = mid + sqrt(max(0.01f, mid*mid - det));
-    float radius = ceil(3.0f * sqrt(lambda));
-
-    if (radius > 1024.0f) { gRadius[id.x] = 0.0f; return; }
-
-    if (posSS.x + radius < 0.0f || posSS.x - radius > (float)filmWidth ||
-        posSS.y + radius < 0.0f || posSS.y - radius > (float)filmHeight)
-    {
-        gRadius[id.x] = 0.0f;
-        return;
-    }
-
-    float3 invCov = float3(cov2D.z, -cov2D.y, cov2D.x) / det;
-
-    float3 color = ComputeSphericalHarmonics(id.x, posWS, cameraPos);
-
-    gPositionSS[id.x]    = posSS;
-    gDepth[id.x]         = posCS.z / posCS.w;
-
-    if (debugFixedRadius > 0) {
-        float fr = (float)debugFixedRadius;
-        gRadius[id.x]        = fr;
-        gColor[id.x]         = color;
-        float invR2 = 1.0f / (fr * fr * 0.1111f);
-        gCov2D_opacity[id.x] = float4(invR2, 0.0f, invR2, gOpacity[id.x]);
-    } else {
-        gRadius[id.x]        = radius;
-        gColor[id.x]         = color;
-        gCov2D_opacity[id.x] = float4(invCov, gOpacity[id.x]);
-    }
-}
-)HLSL";
-
-// Production render shader (same as single-instance, reads from sorted indices)
-static const char* kProdShaderSrc = R"HLSL(
-StructuredBuffer<float2> gPositionSS    : register(t0);
-StructuredBuffer<float>  gRadius        : register(t1);
-StructuredBuffer<float3> gColor         : register(t2);
-StructuredBuffer<float4> gCov2D_Opacity : register(t3);
-StructuredBuffer<float>  gDepth         : register(t4);
-StructuredBuffer<uint>   gSortedIndices : register(t5);
-StructuredBuffer<uint>   gMask          : register(t6);
-
-cbuffer CBRender : register(b0)
-{
-    float2 gViewportSize;
-    float2 pad;
-};
-
-struct PS_IN {
-    float4 clipPos  : SV_Position;
-    float3 color    : COLOR0;
-    float  opacity  : TEXCOORD3;
-    float2 pixelOff : TEXCOORD0;
-    float3 invCov2D : TEXCOORD1;
-    float  selected : TEXCOORD2;   // 0 or 1
-};
-
-float sigmoid_approx(float x) { return 1.0f / (1.0f + exp(-x)); }
-
-PS_IN VS(uint cornerID : SV_VertexID, uint iid : SV_InstanceID)
-{
-    PS_IN o = (PS_IN)0;
-
-    uint idx = gSortedIndices[iid];
-    float r  = gRadius[idx];
-
-    if (r <= 0.0f) { o.clipPos = float4(0, 0, -2, 1); return o; }
-
-    uint  m    = gMask[idx];
-    if (m & 2u) { o.clipPos = float4(0, 0, -2, 1); return o; }  // deleted
-
-    float2 spos  = gPositionSS[idx];
-    float3 col   = gColor[idx];
-    float4 cov4  = gCov2D_Opacity[idx];
-    float  depth = gDepth[idx];
-
-    float2 ndc = spos / gViewportSize * 2.0f - 1.0f;
-
-    static const float2 corners[4] = {
-        float2(-1.f,  1.f), float2( 1.f,  1.f),
-        float2(-1.f, -1.f), float2( 1.f, -1.f),
-    };
-    float2 corner  = corners[cornerID];
-    float2 halfNDC = float2(r / gViewportSize.x, r / gViewportSize.y) * 2.0f;
-
-    o.clipPos   = float4(ndc + corner * halfNDC, depth, 1.0f);
-    o.color     = col;
-    o.opacity   = sigmoid_approx(cov4.w);
-    o.pixelOff  = corner * r;
-    o.invCov2D  = cov4.xyz;
-    o.selected  = (m & 1u) ? 1.0f : 0.0f;
-    return o;
-}
-
-float4 PS(PS_IN i) : SV_Target
-{
-    float x = i.pixelOff.x, y = i.pixelOff.y;
-    float a = i.invCov2D.x, b = i.invCov2D.y, c = i.invCov2D.z;
-    float power = -0.5f * (a*x*x + 2.0f*b*x*y + c*y*y);
-    if (power > 0.0f) discard;
-    float alpha = i.opacity * exp(power);
-    if (alpha < 1.0f / 255.0f) discard;
-
-    float3 col = i.color;
-    if (i.selected > 0.5f) {
-        // Tint selected splats toward bright yellow; boost alpha a bit
-        col   = lerp(col, float3(1.0f, 0.85f, 0.15f), 0.75f);
-        alpha = min(1.0f, alpha * 1.5f + 0.15f);
-    }
-    return float4(col, alpha);
-}
-)HLSL";
-
-// Radix sort CS (identical to single-instance)
-static const char* kRadixSortCS = R"HLSL(
-#define SORT_GROUP_SIZE 256
-#define ITEMS_PER_THREAD 16
-#define TILE_SIZE (SORT_GROUP_SIZE * ITEMS_PER_THREAD)
-#define RADIX_SIZE 256
-
-cbuffer SortCB : register(b0) {
-    uint gNumElements;
-    uint gNumBlocks;
-    uint gShift;
-    uint gPadSort;
-};
-
-uint FloatToSortKey(float f) {
-    uint bits = asuint(f);
-    uint mask = (-(int)(bits >> 31)) | 0x80000000u;
-    return bits ^ mask;
-}
-
-#ifdef KEYGEN_KERNEL
-StructuredBuffer<float>    gDepthIn   : register(t0);
-RWStructuredBuffer<uint>   gKeysOut   : register(u0);
-RWStructuredBuffer<uint>   gValsOut   : register(u1);
-
-[numthreads(SORT_GROUP_SIZE, 1, 1)]
-void KeyGenKernel(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= gNumElements) return;
-    gKeysOut[id.x] = ~FloatToSortKey(gDepthIn[id.x]);
-    gValsOut[id.x] = id.x;
-}
-#endif
-
-#ifdef COUNT_KERNEL
-StructuredBuffer<uint>     gKeysIn    : register(t0);
-RWStructuredBuffer<uint>   gBlockHist : register(u0);
-
-groupshared uint sHist[RADIX_SIZE];
-
-[numthreads(SORT_GROUP_SIZE, 1, 1)]
-void CountKernel(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
-    sHist[tid.x] = 0;
-    GroupMemoryBarrierWithGroupSync();
-
-    uint base = gid.x * TILE_SIZE;
-    for (uint i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint idx = base + tid.x + i * SORT_GROUP_SIZE;
-        if (idx < gNumElements) {
-            uint digit = (gKeysIn[idx] >> gShift) & 0xFFu;
-            InterlockedAdd(sHist[digit], 1u);
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    gBlockHist[gid.x * RADIX_SIZE + tid.x] = sHist[tid.x];
-}
-#endif
-
-#ifdef SCAN_KERNEL
-RWStructuredBuffer<uint> gBlockHist : register(u0);
-
-groupshared uint sDigitTotal[RADIX_SIZE];
-
-[numthreads(RADIX_SIZE, 1, 1)]
-void ScanKernel(uint3 tid : SV_GroupThreadID) {
-    uint digit = tid.x;
-
-    uint total = 0;
-    for (uint b = 0; b < gNumBlocks; b++) {
-        uint count = gBlockHist[b * RADIX_SIZE + digit];
-        gBlockHist[b * RADIX_SIZE + digit] = total;
-        total += count;
-    }
-
-    sDigitTotal[digit] = total;
-    GroupMemoryBarrierWithGroupSync();
-
-    if (digit == 0) {
-        uint sum = 0;
-        for (uint d = 0; d < RADIX_SIZE; d++) {
-            uint t = sDigitTotal[d];
-            sDigitTotal[d] = sum;
-            sum += t;
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    uint digitOff = sDigitTotal[digit];
-    for (uint b2 = 0; b2 < gNumBlocks; b2++) {
-        gBlockHist[b2 * RADIX_SIZE + digit] += digitOff;
-    }
-}
-#endif
-
-#ifdef SCATTER_KERNEL
-StructuredBuffer<uint>     gKeysIn     : register(t0);
-StructuredBuffer<uint>     gValsIn     : register(t1);
-StructuredBuffer<uint>     gBlockOff   : register(t2);
-RWStructuredBuffer<uint>   gKeysOut    : register(u0);
-RWStructuredBuffer<uint>   gValsOut    : register(u1);
-
-groupshared uint sLocalRank[RADIX_SIZE];
-
-[numthreads(SORT_GROUP_SIZE, 1, 1)]
-void ScatterKernel(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
-    sLocalRank[tid.x] = 0;
-    GroupMemoryBarrierWithGroupSync();
-
-    uint base = gid.x * TILE_SIZE;
-    for (uint i = 0; i < ITEMS_PER_THREAD; i++) {
-        uint idx = base + tid.x + i * SORT_GROUP_SIZE;
-        if (idx < gNumElements) {
-            uint key   = gKeysIn[idx];
-            uint val   = gValsIn[idx];
-            uint digit = (key >> gShift) & 0xFFu;
-
-            uint rank;
-            InterlockedAdd(sLocalRank[digit], 1u, rank);
-
-            uint pos = gBlockOff[gid.x * RADIX_SIZE + digit] + rank;
-            gKeysOut[pos] = key;
-            gValsOut[pos] = val;
-        }
-    }
-}
-#endif
-)HLSL";
-
-// Depth pass CS (identical to single-instance)
-static const char* kDepthPassCS = R"HLSL(
-cbuffer DepthCB : register(b0)
-{
-    uint  gViewportW;
-    uint  gViewportH;
-    uint  gSplatCount;
-    uint  gRadiusCap;
-    float gAlphaThreshold;
-    float gDpadA, gDpadB, gDpadC;
-};
-
-RWTexture2D<uint> gDepthUAV : register(u0);
-
-#ifdef CLEAR_DEPTH_KERNEL
-[numthreads(16, 16, 1)]
-void ClearDepthKernel(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= gViewportW || id.y >= gViewportH) return;
-    gDepthUAV[id.xy] = asuint(1.0f);
-}
-#endif
-
-#ifdef DEPTH_PASS_KERNEL
-StructuredBuffer<float2> gPositionSS   : register(t0);
-StructuredBuffer<float>  gRadius       : register(t1);
-StructuredBuffer<float>  gDepth        : register(t2);
-StructuredBuffer<float4> gCov2DOpacity : register(t3);
-
-float sigmoid_approx(float x) { return 1.0f / (1.0f + exp(-x)); }
-
-[numthreads(256, 1, 1)]
-void DepthPassKernel(uint3 id : SV_DispatchThreadID)
-{
-    uint sidx = id.x;
-    if (sidx >= gSplatCount) return;
-
-    float r = gRadius[sidx];
-    if (r <= 0.0f) return;
-
-    float  depth  = gDepth[sidx];
-    if (depth <= 0.0f || depth >= 1.0f) return;
-
-    float4 cov4   = gCov2DOpacity[sidx];
-    float  opacity = sigmoid_approx(cov4.w);
-    if (opacity < gAlphaThreshold) return;
-
-    float2 center = gPositionSS[sidx];
-
-    float rCapped = min(r, (float)gRadiusCap);
-
-    int minX = max(0, (int)floor(center.x - rCapped));
-    int maxX = min((int)gViewportW - 1, (int)ceil (center.x + rCapped));
-    int minY = max(0, (int)floor(center.y - rCapped));
-    int maxY = min((int)gViewportH - 1, (int)ceil (center.y + rCapped));
-    if (minX > maxX || minY > maxY) return;
-
-    uint  depthBits = asuint(depth);
-    float a = cov4.x, b = cov4.y, c = cov4.z;
-
-    for (int y = minY; y <= maxY; y++) {
-        for (int x = minX; x <= maxX; x++) {
-            float dx = (float)x + 0.5f - center.x;
-            float dy = (float)y + 0.5f - center.y;
-            float power = -0.5f * (a*dx*dx + 2.0f*b*dx*dy + c*dy*dy);
-            if (power > 0.0f) continue;
-            float alpha = opacity * exp(power);
-            if (alpha < gAlphaThreshold) continue;
-            InterlockedMin(gDepthUAV[uint2(x, y)], depthBits);
-        }
-    }
-}
-#endif
-)HLSL";
-
-// Selection CS: project each splat through worldMat then viewProj, test if
-// projected NDC is inside [rectMin, rectMax], update mask bit 0 per mode.
-// Bit 1 (deleted) is preserved; deleted splats are never newly selected.
-static const char* kSelectCS = R"HLSL(
-cbuffer SelectCB : register(b0) {
-    row_major float4x4 worldMat;
-    row_major float4x4 viewProj;
-    float2 rectMin;     // NDC space [-1,1]
-    float2 rectMax;
-    uint   splatCount;
-    uint   mode;        // 0=replace, 1=add, 2=subtract, 3=toggle
-    uint   pad0, pad1;
-};
-StructuredBuffer<float3>   gPositionOS : register(t0);
-RWStructuredBuffer<uint>   gMask       : register(u0);
-
-[numthreads(256, 1, 1)]
-void SelectKernel(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= splatCount) return;
-
-    uint cur = gMask[id.x];
-    if (cur & 2u) return;  // deleted: never touch
-
-    float4 p = mul(float4(gPositionOS[id.x], 1.0f), worldMat);
-    p = mul(p, viewProj);
-    bool behind = (p.w <= 0.0f);
-    float3 ndc = p.xyz / max(abs(p.w), 1e-6f) * sign(p.w);
-    bool inRect = !behind &&
-                  ndc.x >= rectMin.x && ndc.x <= rectMax.x &&
-                  ndc.y >= rectMin.y && ndc.y <= rectMax.y;
-
-    uint oldSel = cur & 1u;
-    uint newSel;
-    if      (mode == 0u) newSel = inRect ? 1u : 0u;                          // replace
-    else if (mode == 1u) newSel = (inRect || (oldSel != 0u)) ? 1u : 0u;      // add
-    else if (mode == 2u) newSel = (inRect ? 0u : oldSel);                    // subtract
-    else                 newSel = inRect ? (oldSel ^ 1u) : oldSel;           // toggle
-
-    gMask[id.x] = (cur & ~1u) | newSel;
-}
-)HLSL";
-
-// Depth copy shader (identical to single-instance)
-static const char* kDepthCopyShader = R"HLSL(
-Texture2D<uint> gDepthSrc : register(t0);
-
-struct VS_OUT { float4 pos : SV_Position; };
-
-VS_OUT CopyVS(uint vid : SV_VertexID)
-{
-    VS_OUT o;
-    float2 uv = float2((vid << 1) & 2, vid & 2);
-    o.pos = float4(uv * 2.0f - 1.0f, 0.0f, 1.0f);
-    o.pos.y = -o.pos.y;
-    return o;
-}
-
-void CopyPS(VS_OUT i, out float outDepth : SV_Depth)
-{
-    uint2 pix = uint2(i.pos.xy);
-    uint  bits = gDepthSrc.Load(int3(pix, 0));
-    outDepth = asfloat(bits);
-}
-)HLSL";
 
 // ===========================================================================
 // Constants
@@ -770,8 +251,10 @@ bool GaussianRenderManager::initPipeline(ID3D11Device* device) {
 
     // Compile merged preprocess CS
     {
+        std::string src = gs::LoadShader("merged_preprocess.hlsl");
+        if (src.empty()) return false;
         ID3DBlob* blob = nullptr;
-        if (!CompileStage(kMergedPreprocessCS, strlen(kMergedPreprocessCS),
+        if (!CompileStage(src.c_str(), src.size(),
                           "PreprocessKernel", "cs_5_0", &blob))
             return false;
         hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -792,10 +275,11 @@ bool GaussianRenderManager::initPipeline(ID3D11Device* device) {
 
     // Production render shaders
     {
-        size_t srcLen = strlen(kProdShaderSrc);
+        std::string src = gs::LoadShader("production.hlsl");
+        if (src.empty()) return false;
         ID3DBlob* vsBlob = nullptr, *psBlob = nullptr;
-        if (!CompileStage(kProdShaderSrc, srcLen, "VS", "vs_5_0", &vsBlob)) return false;
-        if (!CompileStage(kProdShaderSrc, srcLen, "PS", "ps_5_0", &psBlob)) { vsBlob->Release(); return false; }
+        if (!CompileStage(src.c_str(), src.size(), "VS", "vs_5_0", &vsBlob)) return false;
+        if (!CompileStage(src.c_str(), src.size(), "PS", "ps_5_0", &psBlob)) { vsBlob->Release(); return false; }
 
         hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_prodVS);
         if (FAILED(hr)) { vsBlob->Release(); psBlob->Release(); return false; }
@@ -847,7 +331,8 @@ bool GaussianRenderManager::initPipeline(ID3D11Device* device) {
 }
 
 bool GaussianRenderManager::initSortPipeline(ID3D11Device* device) {
-    size_t srcLen = strlen(kRadixSortCS);
+    std::string src = gs::LoadShader("radix_sort.hlsl");
+    if (src.empty()) return false;
 
     struct KernelDef { const char* define; const char* entry; ID3D11ComputeShader** out; };
     KernelDef kernels[] = {
@@ -860,7 +345,7 @@ bool GaussianRenderManager::initSortPipeline(ID3D11Device* device) {
     for (auto& k : kernels) {
         D3D_SHADER_MACRO defines[] = { { k.define, "1" }, { nullptr, nullptr } };
         ID3DBlob* blob = nullptr;
-        if (!CompileStage(kRadixSortCS, srcLen, k.entry, "cs_5_0", &blob, defines)) return false;
+        if (!CompileStage(src.c_str(), src.size(), k.entry, "cs_5_0", &blob, defines)) return false;
         HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(),
                                                   blob->GetBufferSize(), nullptr, k.out);
         blob->Release();
@@ -880,9 +365,10 @@ bool GaussianRenderManager::initSortPipeline(ID3D11Device* device) {
 }
 
 bool GaussianRenderManager::initSelectPipeline(ID3D11Device* device) {
-    size_t srcLen = strlen(kSelectCS);
+    std::string src = gs::LoadShader("select.hlsl");
+    if (src.empty()) return false;
     ID3DBlob* blob = nullptr;
-    if (!CompileStage(kSelectCS, srcLen, "SelectKernel", "cs_5_0", &blob)) return false;
+    if (!CompileStage(src.c_str(), src.size(), "SelectKernel", "cs_5_0", &blob)) return false;
     HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(),
                                               blob->GetBufferSize(),
                                               nullptr, &m_selectCS);
@@ -972,12 +458,13 @@ bool GaussianRenderManager::runSelection(ID3D11Device* /*device*/, ID3D11DeviceC
 }
 
 bool GaussianRenderManager::initDepthPassPipeline(ID3D11Device* device) {
-    size_t csLen = strlen(kDepthPassCS);
+    std::string depthSrc = gs::LoadShader("depth_pass.hlsl");
+    if (depthSrc.empty()) return false;
 
     {
         D3D_SHADER_MACRO defs[] = { { "CLEAR_DEPTH_KERNEL", "1" }, { nullptr, nullptr } };
         ID3DBlob* blob = nullptr;
-        if (!CompileStage(kDepthPassCS, csLen, "ClearDepthKernel", "cs_5_0", &blob, defs)) return false;
+        if (!CompileStage(depthSrc.c_str(), depthSrc.size(), "ClearDepthKernel", "cs_5_0", &blob, defs)) return false;
         HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
                                                   nullptr, &m_depthClearCS);
         blob->Release();
@@ -986,7 +473,7 @@ bool GaussianRenderManager::initDepthPassPipeline(ID3D11Device* device) {
     {
         D3D_SHADER_MACRO defs[] = { { "DEPTH_PASS_KERNEL", "1" }, { nullptr, nullptr } };
         ID3DBlob* blob = nullptr;
-        if (!CompileStage(kDepthPassCS, csLen, "DepthPassKernel", "cs_5_0", &blob, defs)) return false;
+        if (!CompileStage(depthSrc.c_str(), depthSrc.size(), "DepthPassKernel", "cs_5_0", &blob, defs)) return false;
         HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
                                                   nullptr, &m_depthPassCS);
         blob->Release();
@@ -1001,10 +488,11 @@ bool GaussianRenderManager::initDepthPassPipeline(ID3D11Device* device) {
         if (FAILED(device->CreateBuffer(&cbd, nullptr, &m_depthCB))) return false;
     }
     {
-        size_t vsLen = strlen(kDepthCopyShader);
+        std::string copySrc = gs::LoadShader("depth_copy.hlsl");
+        if (copySrc.empty()) return false;
         ID3DBlob* vsBlob = nullptr, *psBlob = nullptr;
-        if (!CompileStage(kDepthCopyShader, vsLen, "CopyVS", "vs_5_0", &vsBlob)) return false;
-        if (!CompileStage(kDepthCopyShader, vsLen, "CopyPS", "ps_5_0", &psBlob)) { vsBlob->Release(); return false; }
+        if (!CompileStage(copySrc.c_str(), copySrc.size(), "CopyVS", "vs_5_0", &vsBlob)) return false;
+        if (!CompileStage(copySrc.c_str(), copySrc.size(), "CopyPS", "ps_5_0", &psBlob)) { vsBlob->Release(); return false; }
         HRESULT hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_depthCopyVS);
         if (FAILED(hr)) { vsBlob->Release(); psBlob->Release(); return false; }
         hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_depthCopyPS);

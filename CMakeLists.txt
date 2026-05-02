@@ -57,6 +57,7 @@ set(SOURCES
     ${SRC_DIR}/GaussianDrawOverride.cpp
     ${SRC_DIR}/GaussianRenderManager.cpp
     ${SRC_DIR}/GaussianSelection.cpp
+    ${SRC_DIR}/ShaderLoader.cpp
 )
 
 set(HEADERS
@@ -67,11 +68,17 @@ set(HEADERS
     ${SRC_DIR}/GaussianDrawOverride.h
     ${SRC_DIR}/GaussianRenderManager.h
     ${SRC_DIR}/GaussianSelection.h
+    ${SRC_DIR}/ShaderLoader.h
 )
 
 set(SHADERS
-    ${SHADER_DIR}/gaussianDebug.fx
-    ${SHADER_DIR}/Preprocessing.compute
+    ${SHADER_DIR}/merged_preprocess.hlsl
+    ${SHADER_DIR}/production.hlsl
+    ${SHADER_DIR}/radix_sort.hlsl
+    ${SHADER_DIR}/depth_pass.hlsl
+    ${SHADER_DIR}/select.hlsl
+    ${SHADER_DIR}/depth_copy.hlsl
+    ${SHADER_DIR}/debug.hlsl
 )
 
 # for .sln explorer

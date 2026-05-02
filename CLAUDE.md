@@ -82,7 +82,7 @@ PLY 文件 ──▶ PLYReader ──▶ GaussianData (GaussianNode 内部)
 
 | 文件 | 说明 |
 |---|---|
-| `plugin_main.cpp` | 注册 **1 个节点** + DrawOverride + 5 个命令 + context 命令；内嵌 MEL 构建菜单和 AE 模板 |
+| `plugin_main.cpp` | 注册 **1 个节点** + DrawOverride + 5 个命令 + context 命令；初始化 `gs::SetPluginDir`；内嵌 MEL 构建菜单和 AE 模板 |
 | `GaussianNode.{h,cpp}` | **自包含** MPxLocatorNode。持有 GaussianData、5 个输入 SRV、selection mask buffer。`compute()` 在 filePath 变化时加载 PLY；所有 GPU buffer 管理、mask 操作都在这里 |
 | `GaussianDataNode.{h,cpp}` | **已废弃**，保留为空 stub，不注册任何节点 |
 | `GaussianDrawOverride.{h,cpp}` | 渲染路径。`prepareForDraw` 直接从 `m_node`（GaussianNode）取 SRV；注册到 RenderManager |
@@ -90,17 +90,27 @@ PLY 文件 ──▶ PLYReader ──▶ GaussianData (GaussianNode 内部)
 | `GaussianSelection.{h,cpp}` | 5 个 Maya 命令（`gsMarqueeSelect`/`gsClearSelection`/`gsDeleteSelected`/`gsRestoreAll`/`gsSavePLY`）+ `GSMarqueeContext`（VP2.0 框选工具） |
 | `PLYReader.{h,cpp}` | binary_little_endian + ASCII；exp(log_scale)；四元数归一化；SH planar→interleaved |
 | `GaussianData.h` | POD：`GaussianSplat` 原始数据 + `GaussianData` 展平数组 + bbox；`kMaskBitSelected=1, kMaskBitDeleted=2` |
+| `ShaderLoader.{h,cpp}` | 运行时加载 `shaders/*.hlsl`。`gs::SetPluginDir` 在 initializePlugin 时记录 .mll 目录；`gs::LoadShader("foo.hlsl")` 返回源字符串 |
 
-### 关键点：所有 HLSL 内嵌在 GaussianRenderManager.cpp / GaussianDrawOverride.cpp
+### Shader 文件（运行时加载）
 
-| 变量 | 位置 | 内容 |
+7 个 `.hlsl` 在 `GaussianSplatting/shaders/`，CMake post-build 把整个目录复制到 `.mll` 旁边。运行时通过 `gs::LoadShader("name.hlsl")` 读取。
+
+| 文件 | 内容 | 编译入口 |
 |---|---|---|
-| `kMergedPreprocessCS` | GaussianRenderManager.cpp | 合并多实例的预处理 CS（读 instanceID + worldMats）|
-| `kProdShaderSrc` | GaussianRenderManager.cpp | Production VS+PS（实例化椭圆）|
-| `kRadixSortCS` | GaussianRenderManager.cpp | 4 个 radix sort kernel |
-| `kDbgShaderSrc` | GaussianDrawOverride.cpp | Debug VS+GS+PS（圆点）|
+| `merged_preprocess.hlsl` | 合并多实例预处理 CS | `PreprocessKernel` |
+| `production.hlsl` | Production VS+PS（实例化椭圆） | `VS`/`PS` |
+| `radix_sort.hlsl` | 4 个 radix sort kernel | 用 `-DKEYGEN_KERNEL`/`-DCOUNT_KERNEL`/`-DSCAN_KERNEL`/`-DSCATTER_KERNEL` 切换 |
+| `depth_pass.hlsl` | 深度图 clear + atomic-min CS | 用 `-DCLEAR_DEPTH_KERNEL`/`-DDEPTH_PASS_KERNEL` 切换 |
+| `select.hlsl` | （目前未走，CPU 路径覆盖）GPU 框选 CS | `SelectKernel` |
+| `depth_copy.hlsl` | 全屏 quad 把 R32_UINT 写回 SV_Depth | `CopyVS`/`CopyPS` |
+| `debug.hlsl` | Debug VS+GS+PS（圆点） | `VS`/`GS`/`PS` |
 
-**`shaders/` 目录下的文件是遗留参考，不参与构建。** 修改 shader 必须编辑上述 C++ 字符串常量。
+**搜索路径**（`gs::LoadShader` 内部）：
+1. `$GAUSSIAN_SHADER_DIR/<name>.hlsl`（环境变量覆盖）
+2. `<pluginDir>/shaders/<name>.hlsl`（默认，CMake 部署位置）
+
+修改 shader **直接编辑 .hlsl 文件**。无运行时 reload 命令——改完重启 Maya 或 unload/load 插件即可。
 
 ## 渲染管线细节
 
